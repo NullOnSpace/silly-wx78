@@ -144,8 +144,8 @@ pub struct MessageEvent {
 }
 
 #[async_trait::async_trait]
-pub trait EventHandler: Send + Sync {
-    async fn on_message(&self, message: MessageEvent, token: &str);
+pub trait WebSocketHandler: Send + Sync {
+    async fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>);
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,7 +185,6 @@ pub struct WebSocketClient {
     config: WebSocketConfig,
     session_id: Arc<tokio::sync::RwLock<Option<String>>>,
     last_sequence: Arc<AtomicI32>,
-    event_handler: Option<Arc<dyn EventHandler>>,
 }
 
 impl WebSocketClient {
@@ -194,16 +193,14 @@ impl WebSocketClient {
             config,
             session_id: Arc::new(tokio::sync::RwLock::new(None)),
             last_sequence: Arc::new(AtomicI32::new(0)),
-            event_handler: None,
         }
     }
 
-    pub fn with_event_handler(mut self, handler: Arc<dyn EventHandler>) -> Self {
-        self.event_handler = Some(handler);
-        self
+    pub fn token(&self) -> &str {
+        &self.config.token
     }
 
-    pub async fn connect(&self) -> Result<(), WebSocketError> {
+    pub async fn connect(self: Arc<Self>, handler: Arc<dyn WebSocketHandler>) -> Result<(), WebSocketError> {
         info!(url = %GATEWAY_URL, "开始连接WebSocket");
         
         let (ws_stream, _) = connect_async(GATEWAY_URL).await?;
@@ -375,29 +372,24 @@ impl WebSocketClient {
         });
 
         info!("开始接收事件");
-        
-        let event_handler = self.event_handler.clone();
-        let token = self.config.token.clone();
 
         while let Some(event) = event_rx.recv().await {
             debug!(event = ?event, "收到事件");
             
-            if let Some(handler) = &event_handler {
-                if let Ok(message_event) = serde_json::from_value::<MessageEvent>(event.clone()) {
-                    if message_event.message_type == 0 {
-                        info!(
-                            message_id = %message_event.id,
-                            author_id = %message_event.author.id,
-                            content = %message_event.content,
-                            "收到文本消息"
-                        );
-                        
-                        let handler_clone = Arc::clone(handler);
-                        let token_clone = token.clone();
-                        tokio::spawn(async move {
-                            handler_clone.on_message(message_event, &token_clone).await;
-                        });
-                    }
+            if let Ok(message_event) = serde_json::from_value::<MessageEvent>(event.clone()) {
+                if message_event.message_type == 0 {
+                    info!(
+                        message_id = %message_event.id,
+                        author_id = %message_event.author.id,
+                        content = %message_event.content,
+                        "收到文本消息"
+                    );
+                    
+                    let handler_clone = Arc::clone(&handler);
+                    let client_clone = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        handler_clone.on_message(message_event, client_clone).await;
+                    });
                 }
             }
         }

@@ -110,10 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let handler = Arc::new(DefaultMessageHandler);
             let ws_config = WebSocketConfig::new(token, intents);
-            let ws_client = WebSocketClient::new(ws_config).with_event_handler(handler);
+            let ws_client = Arc::new(WebSocketClient::new(ws_config));
             
             info!(intents = intents, "启动WebSocket服务");
-            ws_client.connect().await?;
+            ws_client.connect(handler).await?;
         }
     }
 
