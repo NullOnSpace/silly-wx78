@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +26,7 @@ pub enum WebSocketError {
     Receive(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize_repr, Deserialize_repr)]
 #[repr(i32)]
 pub enum OpCode {
     Dispatch = 0,
@@ -36,35 +37,6 @@ pub enum OpCode {
     InvalidSession = 9,
     Hello = 10,
     HeartbeatAck = 11,
-}
-
-impl Serialize for OpCode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_i32(*self as i32)
-    }
-}
-
-impl<'de> Deserialize<'de> for OpCode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = i32::deserialize(deserializer)?;
-        match value {
-            0 => Ok(OpCode::Dispatch),
-            1 => Ok(OpCode::Heartbeat),
-            2 => Ok(OpCode::Identify),
-            6 => Ok(OpCode::Resume),
-            7 => Ok(OpCode::Reconnect),
-            9 => Ok(OpCode::InvalidSession),
-            10 => Ok(OpCode::Hello),
-            11 => Ok(OpCode::HeartbeatAck),
-            _ => Err(serde::de::Error::custom(format!("Unknown OpCode: {}", value))),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
