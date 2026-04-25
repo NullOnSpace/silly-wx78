@@ -1,15 +1,13 @@
 # 单聊
 
 ## 发送
-
     说明
-
     单独发送消息给用户。
 
 - 请求
 
 **调用方式**
-HTTP URL	/v2/users/{openid}/messages
+HTTP URL	`/v2/users/{openid}/messages`
 HTTP Method	POST
 
 - 路径参数
@@ -44,9 +42,7 @@ code	message	说明
 ## 接收事件
 
 ### 单聊消息
-
     说明
-
     用户在单聊发送消息给机器人
 
 - 基本概况
