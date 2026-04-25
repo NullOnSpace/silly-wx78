@@ -1,15 +1,19 @@
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 const GATEWAY_URL: &str = "wss://api.sgroup.qq.com/websocket/";
+const MAX_CONCURRENT_HANDLERS: usize = 10;
 
 #[derive(Error, Debug)]
 pub enum WebSocketError {
@@ -115,9 +119,8 @@ pub struct MessageEvent {
     pub message_scene: Option<MessageScene>,
 }
 
-#[async_trait::async_trait]
 pub trait WebSocketHandler: Send + Sync {
-    async fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>);
+    fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,13 +136,13 @@ struct IncomingMessage {
 
 #[derive(Debug, Clone)]
 pub struct WebSocketConfig {
-    pub token: String,
+    pub token: Arc<str>,
     pub intents: i32,
     pub shard: [i32; 2],
 }
 
 impl WebSocketConfig {
-    pub fn new(token: String, intents: i32) -> Self {
+    pub fn new(token: Arc<str>, intents: i32) -> Self {
         Self {
             token,
             intents,
@@ -155,26 +158,32 @@ impl WebSocketConfig {
 
 pub struct WebSocketClient {
     config: WebSocketConfig,
-    session_id: Arc<tokio::sync::RwLock<Option<String>>>,
+    http_client: Arc<Client>,
+    session_id: std::sync::OnceLock<String>,
     last_sequence: Arc<AtomicI32>,
 }
 
 impl WebSocketClient {
-    pub fn new(config: WebSocketConfig) -> Self {
+    pub fn new(config: WebSocketConfig, http_client: Arc<Client>) -> Self {
         Self {
             config,
-            session_id: Arc::new(tokio::sync::RwLock::new(None)),
+            http_client,
+            session_id: std::sync::OnceLock::new(),
             last_sequence: Arc::new(AtomicI32::new(0)),
         }
     }
 
-    pub fn token(&self) -> &str {
+    pub fn token(&self) -> &Arc<str> {
         &self.config.token
+    }
+
+    pub fn http_client(&self) -> &Arc<Client> {
+        &self.http_client
     }
 
     pub async fn connect(self: Arc<Self>, handler: Arc<dyn WebSocketHandler>) -> Result<(), WebSocketError> {
         info!(url = %GATEWAY_URL, "开始连接WebSocket");
-        
+
         let (ws_stream, _) = connect_async(GATEWAY_URL).await?;
         info!("WebSocket连接成功");
 
@@ -199,7 +208,7 @@ impl WebSocketClient {
         let hello_data: HelloData = serde_json::from_value(
             hello.d.ok_or_else(|| WebSocketError::Receive("Hello消息缺少数据".to_string()))?,
         )?;
-        
+
         let heartbeat_interval = hello_data.heartbeat_interval;
         info!(heartbeat_interval = heartbeat_interval, "收到心跳间隔");
 
@@ -243,9 +252,7 @@ impl WebSocketClient {
             ready.d.ok_or_else(|| WebSocketError::Receive("Ready消息缺少数据".to_string()))?,
         )?;
 
-        let mut session_id = self.session_id.write().await;
-        *session_id = Some(ready_data.session_id.clone());
-        drop(session_id);
+        self.session_id.set(ready_data.session_id.clone()).ok();
 
         info!(
             session_id = %ready_data.session_id,
@@ -255,12 +262,12 @@ impl WebSocketClient {
         );
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<()>(1);
-        let (event_tx, mut event_rx) = mpsc::channel::<serde_json::Value>(100);
+        let (event_tx, mut event_rx) = mpsc::channel::<MessageEvent>(32);
 
         let last_sequence = Arc::clone(&self.last_sequence);
         let write_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval));
-            
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -271,7 +278,7 @@ impl WebSocketClient {
                             s: None,
                             t: None,
                         };
-                        
+
                         match serde_json::to_string(&heartbeat) {
                             Ok(json) => {
                                 debug!(seq = seq, "发送心跳");
@@ -285,7 +292,7 @@ impl WebSocketClient {
                             }
                         }
                     }
-                    
+
                     _ = heartbeat_rx.recv() => {
                         info!("停止心跳任务");
                         break;
@@ -294,27 +301,37 @@ impl WebSocketClient {
             }
         });
 
-        let last_sequence_read = Arc::clone(&self.last_sequence);
+        let last_sequence_read = Arc::new(AtomicI32::new(0));
+        let last_sequence_clone = Arc::clone(&last_sequence_read);
         let read_handle = tokio::spawn(async move {
             while let Some(msg_result) = read.next().await {
                 match msg_result {
                     Ok(msg) => {
                         if let Ok(text) = msg.to_text() {
                             debug!(message = %text, "收到消息");
-                            
+
                             if let Ok(incoming) = serde_json::from_str::<IncomingMessage>(text) {
                                 if let Some(seq) = incoming.s {
-                                    last_sequence_read.store(seq, Ordering::Relaxed);
+                                    last_sequence_clone.store(seq, Ordering::Relaxed);
                                 }
-                                
+
                                 match incoming.op {
                                     OpCode::HeartbeatAck => {
                                         debug!("收到心跳ACK");
                                     }
                                     OpCode::Dispatch => {
-                                        if let Some(data) = incoming.d {
-                                            if let Err(e) = event_tx.send(data).await {
-                                                error!(error = %e, "发送事件到通道失败");
+                                        if let Some(t) = incoming.t.as_deref() {
+                                            if t == "C2C_MESSAGE_CREATE" {
+                                                #[allow(clippy::collapsible_if)]
+                                                if let Some(data) = incoming.d
+                                                    && let Ok(message_event) = serde_json::from_value::<MessageEvent>(data)
+                                                    && message_event.message_type == 0 {
+                                                    if let Err(e) = event_tx.send(message_event).await {
+                                                        error!(error = %e, "发送事件到通道失败");
+                                                    }
+                                                }
+                                            } else {
+                                                debug!(event_type = %t, "收到非文本消息事件，忽略");
                                             }
                                         }
                                     }
@@ -339,31 +356,30 @@ impl WebSocketClient {
                     }
                 }
             }
-            
+
             let _ = heartbeat_tx.send(()).await;
         });
 
         info!("开始接收事件");
 
-        while let Some(event) = event_rx.recv().await {
-            debug!(event = ?event, "收到事件");
-            
-            if let Ok(message_event) = serde_json::from_value::<MessageEvent>(event.clone()) {
-                if message_event.message_type == 0 {
-                    info!(
-                        message_id = %message_event.id,
-                        author_id = %message_event.author.id,
-                        content = %message_event.content,
-                        "收到文本消息"
-                    );
-                    
-                    let handler_clone = Arc::clone(&handler);
-                    let client_clone = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        handler_clone.on_message(message_event, client_clone).await;
-                    });
-                }
-            }
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
+
+        while let Some(message_event) = event_rx.recv().await {
+            info!(
+                message_id = %message_event.id,
+                author_id = %message_event.author.id,
+                content = %message_event.content,
+                "收到文本消息"
+            );
+
+            let handler_clone = Arc::clone(&handler);
+            let client_clone = Arc::clone(&self);
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            tokio::spawn(async move {
+                handler_clone.on_message(message_event, client_clone).await;
+                drop(permit);
+            });
         }
 
         write_handle.abort();
@@ -372,7 +388,7 @@ impl WebSocketClient {
         Ok(())
     }
 
-    pub async fn get_session_id(&self) -> Option<String> {
-        self.session_id.read().await.clone()
+    pub fn get_session_id(&self) -> Option<&str> {
+        self.session_id.get().map(|s| s.as_str())
     }
 }

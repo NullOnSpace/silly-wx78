@@ -79,22 +79,28 @@ src/
 实现 `WebSocketHandler` trait 即可自定义事件处理逻辑：
 
 ```rust
-use async_trait::async_trait;
-use qq_bot::{WebSocketClient, WebSocketHandler, MessageEvent};
+use qq_bot::{DirectMessageClient, WebSocketClient, WebSocketHandler, MessageEvent};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 struct MyHandler;
 
-#[async_trait]
 impl WebSocketHandler for MyHandler {
-    async fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>) {
-        let dm_client = DirectMessageClient::new(client.token().to_string());
-        dm_client.reply_message(
-            &message.author.user_openid.unwrap(),
-            message.id,
-            "自定义回复".to_string(),
-            None,
-        ).await.ok();
+    fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let openid = message.author.user_openid.as_deref().unwrap_or(&message.author.id);
+            let dm_client = DirectMessageClient::new(
+                Arc::clone(client.http_client()),
+                Arc::clone(client.token()),
+            );
+            dm_client.reply_message(
+                openid,
+                message.id,
+                "自定义回复".to_string(),
+                None,
+            ).await.ok();
+        })
     }
 }
 ```
@@ -102,8 +108,13 @@ impl WebSocketHandler for MyHandler {
 在启动时传入自定义处理器：
 
 ```rust
-let handler = Arc::new(MyHandler);
-let ws_client = Arc::new(WebSocketClient::new(config));
+let http_client = Arc::new(reqwest::Client::new());
+let config = AuthConfig::from_env()?;
+let auth_client = AuthClient::new(config, Arc::clone(&http_client));
+let token = auth_client.get_access_token().await?;
+
+let ws_config = WebSocketConfig::new(token, intents);
+let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
 ws_client.connect(handler).await?;
 ```
 

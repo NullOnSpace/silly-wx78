@@ -64,14 +64,13 @@ where
     s.parse::<i64>().map_err(serde::de::Error::custom)
 }
 
-#[derive(Debug, Clone)]
 struct CachedToken {
-    access_token: String,
+    access_token: Arc<str>,
     expires_at: Instant,
 }
 
 impl CachedToken {
-    fn new(access_token: String, expires_in: i64) -> Self {
+    fn new(access_token: Arc<str>, expires_in: i64) -> Self {
         let expires_at = Instant::now() + std::time::Duration::from_secs((expires_in - 60) as u64);
         Self {
             access_token,
@@ -86,26 +85,26 @@ impl CachedToken {
 
 pub struct AuthClient {
     config: AuthConfig,
-    http_client: Client,
-    cached_token: Arc<RwLock<Option<CachedToken>>>,
+    http_client: Arc<Client>,
+    cached_token: RwLock<Option<CachedToken>>,
 }
 
 impl AuthClient {
-    pub fn new(config: AuthConfig) -> Self {
+    pub fn new(config: AuthConfig, http_client: Arc<Client>) -> Self {
         Self {
             config,
-            http_client: Client::new(),
-            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+            cached_token: RwLock::new(None),
         }
     }
 
-    pub async fn get_access_token(&self) -> Result<String, AuthError> {
+    pub async fn get_access_token(&self) -> Result<Arc<str>, AuthError> {
         debug!("尝试获取access_token");
         let cached = self.cached_token.read().await;
         if let Some(token) = cached.as_ref() {
             if !token.is_expired() {
                 debug!("使用缓存的access_token");
-                return Ok(token.access_token.clone());
+                return Ok(Arc::clone(&token.access_token));
             } else {
                 warn!("缓存的access_token已过期，需要刷新");
             }
@@ -117,7 +116,7 @@ impl AuthClient {
         self.refresh_token().await
     }
 
-    async fn refresh_token(&self) -> Result<String, AuthError> {
+    async fn refresh_token(&self) -> Result<Arc<str>, AuthError> {
         info!("开始刷新access_token");
         let request = TokenRequest {
             app_id: self.config.app_id.clone(),
@@ -142,7 +141,7 @@ impl AuthClient {
         }
 
         let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-        
+
         let token_response: TokenResponse = match serde_json::from_str(&response_text) {
             Ok(token) => {
                 debug!(response = %response_text, "成功解析响应JSON");
@@ -163,13 +162,14 @@ impl AuthClient {
             "成功获取新的access_token"
         );
 
-        let cached_token = CachedToken::new(token_response.access_token.clone(), token_response.expires_in);
+        let access_token: Arc<str> = Arc::from(token_response.access_token);
+        let cached_token = CachedToken::new(Arc::clone(&access_token), token_response.expires_in);
         debug!("缓存新的access_token");
 
         let mut cache = self.cached_token.write().await;
         *cache = Some(cached_token);
 
-        Ok(token_response.access_token)
+        Ok(access_token)
     }
 
     pub fn authorization_header(token: &str) -> String {

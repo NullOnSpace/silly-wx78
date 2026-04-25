@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
@@ -49,14 +50,14 @@ pub struct ShareLinkResponse {
 }
 
 pub struct ShareLinkClient {
-    http_client: Client,
-    access_token: String,
+    http_client: Arc<Client>,
+    access_token: Arc<str>,
 }
 
 impl ShareLinkClient {
-    pub fn new(access_token: String) -> Self {
+    pub fn new(http_client: Arc<Client>, access_token: Arc<str>) -> Self {
         Self {
-            http_client: Client::new(),
+            http_client,
             access_token,
         }
     }
@@ -66,7 +67,7 @@ impl ShareLinkClient {
         request: ShareLinkRequest,
     ) -> Result<ShareLinkResponse, ShareLinkError> {
         let url = format!("{}/v2/generate_url_link", API_BASE_URL);
-        
+
         info!(
             callback_data = ?request.callback_data,
             "生成机器人分享链接"
@@ -94,7 +95,7 @@ impl ShareLinkClient {
         }
 
         let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-        
+
         let share_link_response: ShareLinkResponse = match serde_json::from_str(&response_text) {
             Ok(link) => {
                 debug!(response = %response_text, "成功解析响应JSON");

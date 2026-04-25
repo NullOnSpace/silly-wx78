@@ -3,6 +3,7 @@ use qq_bot::{
     AuthClient, AuthConfig, DefaultMessageHandler, DirectMessageClient, ShareLinkClient,
     WebSocketClient, WebSocketConfig,
 };
+use reqwest::Client;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -19,7 +20,7 @@ struct Cli {
 enum Commands {
     #[command(about = "获取并显示access_token")]
     Auth,
-    
+
     #[command(about = "发送单聊消息")]
     SendMessage {
         #[arg(short, long, help = "用户的openid")]
@@ -27,13 +28,13 @@ enum Commands {
         #[arg(short, long, help = "消息内容")]
         content: String,
     },
-    
+
     #[command(about = "生成机器人分享链接")]
     GenerateLink {
         #[arg(short, long, help = "回调数据，用于追踪来源")]
         callback_data: Option<String>,
     },
-    
+
     #[command(about = "启动WebSocket服务接收事件")]
     Websocket {
         #[arg(short, long, help = "事件订阅intents，例如: 1073741824 表示 PUBLIC_GUILD_MESSAGES", default_value = "2113934851")]
@@ -56,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let config = AuthConfig::from_env()?;
-    let auth_client = AuthClient::new(config);
+    let http_client = Arc::new(Client::new());
+    let auth_client = AuthClient::new(config, Arc::clone(&http_client));
 
     match cli.command {
         Commands::Auth => {
@@ -64,13 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("成功获取access_token");
             println!("Access Token: {}", token);
         }
-        
+
         Commands::SendMessage { openid, content } => {
             let token = auth_client.get_access_token().await?;
             info!("成功获取access_token");
 
-            let message_client = DirectMessageClient::new(token);
-            
+            let message_client = DirectMessageClient::new(Arc::clone(&http_client), Arc::clone(&token));
+
             match message_client.send_text(&openid, content).await {
                 Ok(response) => {
                     info!(
@@ -87,31 +89,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        
+
         Commands::GenerateLink { callback_data } => {
             let token = auth_client.get_access_token().await?;
             info!("成功获取access_token");
 
-            let share_link_client = ShareLinkClient::new(token);
-            
+            let share_link_client = ShareLinkClient::new(Arc::clone(&http_client), Arc::clone(&token));
+
             let url = if let Some(data) = callback_data {
                 share_link_client.generate_share_link_with_callback(data).await?
             } else {
                 share_link_client.generate_share_link().await?
             };
-            
+
             info!("生成分享链接成功");
             println!("分享链接: {}", url);
         }
-        
+
         Commands::Websocket { intents } => {
             let token = auth_client.get_access_token().await?;
             info!("成功获取access_token");
 
             let handler = Arc::new(DefaultMessageHandler);
             let ws_config = WebSocketConfig::new(token, intents);
-            let ws_client = Arc::new(WebSocketClient::new(ws_config));
-            
+            let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
+
             info!(intents = intents, "启动WebSocket服务");
             ws_client.connect(handler).await?;
         }

@@ -1,6 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
@@ -96,14 +97,14 @@ pub struct Author {
 }
 
 pub struct DirectMessageClient {
-    http_client: Client,
-    access_token: String,
+    http_client: Arc<Client>,
+    access_token: Arc<str>,
 }
 
 impl DirectMessageClient {
-    pub fn new(access_token: String) -> Self {
+    pub fn new(http_client: Arc<Client>, access_token: Arc<str>) -> Self {
         Self {
-            http_client: Client::new(),
+            http_client,
             access_token,
         }
     }
@@ -115,7 +116,7 @@ impl DirectMessageClient {
     ) -> Result<DirectMessageResponse, DirectMessageError> {
         let url = format!("{}/v2/users/{}/messages", API_BASE_URL, openid);
         let msg_json = serde_json::to_string(&message)?;
-        
+
         info!(openid = %openid, message = ?msg_json, "发送单聊消息");
         debug!(url = %url, "请求URL");
 
@@ -140,7 +141,7 @@ impl DirectMessageClient {
         }
 
         let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-        
+
         let message_response: DirectMessageResponse = match serde_json::from_str(&response_text) {
             Ok(msg) => {
                 debug!(response = %response_text, "成功解析响应JSON");
