@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use qq_bot::{
-    AuthClient, AuthConfig, DefaultMessageHandler, DirectMessageClient, ShareLinkClient,
-    WebSocketClient, WebSocketConfig,
+    AuthClient, AuthConfig, CancellationToken, DefaultMessageHandler, DirectMessageClient,
+    ShareLinkClient, WebSocketClient, WebSocketConfig,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -115,7 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
 
             info!(intents = intents, "启动WebSocket服务");
-            ws_client.run(handler).await?;
+            let cancellation_token = CancellationToken::new();
+            ws_client.run(handler, cancellation_token).await?;
         }
     }
 

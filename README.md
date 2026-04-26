@@ -79,7 +79,7 @@ src/
 实现 `WebSocketHandler` trait 即可自定义事件处理逻辑：
 
 ```rust
-use qq_bot::{DirectMessageClient, WebSocketClient, WebSocketHandler, MessageEvent};
+use qq_bot::{CancellationToken, DirectMessageClient, WebSocketClient, WebSocketHandler, MessageEvent};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ let token = auth_client.get_access_token().await?;
 
 let ws_config = WebSocketConfig::new(token, intents);
 let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
-ws_client.run(handler).await?;
+ws_client.run(handler, CancellationToken::new()).await?;
 ```
 
 ## 日志

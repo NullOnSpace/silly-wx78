@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use std::sync::RwLock;
+use tokio::sync::{mpsc, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
@@ -153,8 +155,8 @@ pub trait WebSocketHandler: Send + Sync {
 #[derive(Debug, Deserialize)]
 struct IncomingMessage {
     op: OpCode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    d: Option<serde_json::Value>,
+    #[serde(default)]
+    d: Option<Box<serde_json::value::RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,47 +210,75 @@ impl WebSocketClient {
         &self.http_client
     }
 
-    pub async fn get_session_id(&self) -> Option<String> {
-        self.session_id.read().await.clone()
+    pub fn get_session_id(&self) -> Option<String> {
+        self.session_id.read().ok().and_then(|g| g.clone())
     }
 
     pub fn get_last_sequence(&self) -> i32 {
         self.last_sequence.load(Ordering::Relaxed)
     }
 
-    async fn clear_session(&self) {
-        *self.session_id.write().await = None;
+    fn clear_session(&self) {
+        if let Ok(mut guard) = self.session_id.write() {
+            *guard = None;
+        }
         self.last_sequence.store(0, Ordering::Relaxed);
     }
 
-    pub async fn run(self: Arc<Self>, handler: Arc<dyn WebSocketHandler>) -> Result<(), WebSocketError> {
+    pub async fn run(
+        self: Arc<Self>,
+        handler: Arc<dyn WebSocketHandler>,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), WebSocketError> {
         let mut backoff_secs: u64 = 1;
 
         loop {
-            match Arc::clone(&self).connect_inner(Arc::clone(&handler)).await {
-                Ok(reason) => {
-                    let can_resume = reason != DisconnectReason::InvalidSession;
-                    if !can_resume {
-                        self.clear_session().await;
+            tokio::select! {
+                result = Arc::clone(&self).connect_inner(Arc::clone(&handler), cancellation_token.clone()) => {
+                    match result {
+                        Ok(reason) => {
+                            let can_resume = reason != DisconnectReason::InvalidSession;
+                            if !can_resume {
+                                self.clear_session();
+                            }
+
+                            info!(
+                                reason = ?reason,
+                                can_resume = can_resume,
+                                backoff_secs = backoff_secs,
+                                "连接断开，准备重连"
+                            );
+
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
+                                    backoff_secs = 1;
+                                }
+                                _ = cancellation_token.cancelled() => {
+                                    info!("收到关机信号，停止重连");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.clear_session();
+
+                            error!(error = %e, "连接失败，准备重连");
+
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
+                                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                                }
+                                _ = cancellation_token.cancelled() => {
+                                    info!("收到关机信号，停止重连");
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
-
-                    info!(
-                        reason = ?reason,
-                        can_resume = can_resume,
-                        backoff_secs = backoff_secs,
-                        "连接断开，准备重连"
-                    );
-
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 }
-                Err(e) => {
-                    self.clear_session().await;
-
-                    error!(error = %e, "连接失败，准备重连");
-
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                _ = cancellation_token.cancelled() => {
+                    info!("收到关机信号，停止重连");
+                    return Ok(());
                 }
             }
         }
@@ -257,6 +287,7 @@ impl WebSocketClient {
     async fn connect_inner(
         self: Arc<Self>,
         handler: Arc<dyn WebSocketHandler>,
+        cancellation_token: CancellationToken,
     ) -> Result<DisconnectReason, WebSocketError> {
         info!(url = %GATEWAY_URL, "开始连接WebSocket");
 
@@ -281,16 +312,17 @@ impl WebSocketClient {
             )));
         }
 
-        let hello_data: HelloData = serde_json::from_value(
+        let hello_data: HelloData = serde_json::from_str(
             hello
                 .d
-                .ok_or_else(|| WebSocketError::Receive("Hello消息缺少数据".to_string()))?,
+                .ok_or_else(|| WebSocketError::Receive("Hello消息缺少数据".to_string()))?
+                .get(),
         )?;
 
         let heartbeat_interval = hello_data.heartbeat_interval;
         info!(heartbeat_interval = heartbeat_interval, "收到心跳间隔");
 
-        let session_id = self.session_id.read().await.clone();
+        let session_id = self.session_id.read().ok().and_then(|g| g.clone());
         let seq = self.last_sequence.load(Ordering::Relaxed);
 
         if let Some(sid) = session_id
@@ -343,17 +375,20 @@ impl WebSocketClient {
         match auth_incoming.op {
             OpCode::InvalidSession => {
                 warn!("Resume失败，收到InvalidSession");
-                self.clear_session().await;
+                self.clear_session();
                 return Ok(DisconnectReason::InvalidSession);
             }
             OpCode::Dispatch if auth_incoming.t.as_deref() == Some("READY") => {
-                let ready_data: ReadyData = serde_json::from_value(
+                let ready_data: ReadyData = serde_json::from_str(
                     auth_incoming
                         .d
-                        .ok_or_else(|| WebSocketError::Receive("Ready消息缺少数据".to_string()))?,
+                        .ok_or_else(|| WebSocketError::Receive("Ready消息缺少数据".to_string()))?
+                        .get(),
                 )?;
 
-                *self.session_id.write().await = Some(ready_data.session_id.clone());
+                if let Ok(mut guard) = self.session_id.write() {
+                    *guard = Some(ready_data.session_id.clone());
+                }
 
                 info!(
                     session_id = %ready_data.session_id,
@@ -377,8 +412,6 @@ impl WebSocketClient {
         let (event_tx, mut event_rx) = mpsc::channel::<MessageEvent>(32);
         let last_heartbeat_ack = Arc::new(AtomicI64::new(0));
 
-        let write = Arc::new(Mutex::new(write));
-        let heartbeat_write = Arc::clone(&write);
         let last_sequence = Arc::clone(&self.last_sequence);
         let heartbeat_ack_clone = Arc::clone(&last_heartbeat_ack);
         let disconnect_tx_heartbeat = disconnect_tx.clone();
@@ -390,7 +423,7 @@ impl WebSocketClient {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let now = chrono_specific_now_ms();
+                        let now = now_millis();
                         let last_ack = heartbeat_ack_clone.load(Ordering::Relaxed);
                         if last_ack > 0 && now - last_ack > ack_timeout.as_millis() as i64 {
                             warn!(
@@ -414,8 +447,7 @@ impl WebSocketClient {
                         match serde_json::to_string(&heartbeat) {
                             Ok(json) => {
                                 debug!(seq = seq, "发送心跳");
-                                let mut writer = heartbeat_write.lock().await;
-                                if let Err(e) = writer.send(WsMessage::Text(json.into())).await {
+                                if let Err(e) = write.send(WsMessage::Text(json.into())).await {
                                     error!(error = %e, "发送心跳失败");
                                     let _ = disconnect_tx_heartbeat.send(DisconnectReason::NetworkError).await;
                                     break;
@@ -430,8 +462,7 @@ impl WebSocketClient {
             }
         });
 
-        let last_sequence_read = Arc::new(AtomicI32::new(0));
-        let last_sequence_clone = Arc::clone(&last_sequence_read);
+        let last_sequence_clone = Arc::clone(&self.last_sequence);
         let heartbeat_ack_reader = Arc::clone(&last_heartbeat_ack);
         let disconnect_tx_read = disconnect_tx.clone();
 
@@ -449,7 +480,7 @@ impl WebSocketClient {
 
                                 match incoming.op {
                                     OpCode::HeartbeatAck => {
-                                        heartbeat_ack_reader.store(chrono_specific_now_ms(), Ordering::Relaxed);
+                                        heartbeat_ack_reader.store(now_millis(), Ordering::Relaxed);
                                         debug!("收到心跳ACK");
                                     }
                                     OpCode::Dispatch => {
@@ -457,7 +488,7 @@ impl WebSocketClient {
                                             if t == "C2C_MESSAGE_CREATE" {
                                                 #[allow(clippy::collapsible_if)]
                                                 if let Some(data) = incoming.d
-                                                    && let Ok(message_event) = serde_json::from_value::<MessageEvent>(data)
+                                                    && let Ok(message_event) = serde_json::from_str::<MessageEvent>(data.get())
                                                     && message_event.message_type == 0 {
                                                     if let Err(e) = event_tx.send(message_event).await {
                                                         error!(error = %e, "发送事件到通道失败");
@@ -525,21 +556,20 @@ impl WebSocketClient {
             } => {
                 DisconnectReason::NetworkError
             }
+            _ = cancellation_token.cancelled() => {
+                info!("收到关机信号，断开连接");
+                DisconnectReason::NetworkError
+            }
         };
 
         heartbeat_handle.abort();
         read_handle.abort();
 
-        let seq = last_sequence_read.load(Ordering::Relaxed);
-        if seq > 0 {
-            self.last_sequence.store(seq, Ordering::Relaxed);
-        }
-
         Ok(disconnect_reason)
     }
 }
 
-fn chrono_specific_now_ms() -> i64 {
+fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

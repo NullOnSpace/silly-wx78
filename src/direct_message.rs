@@ -1,11 +1,10 @@
+use crate::{parse_response, ApiError, API_BASE_URL};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, error, info};
-
-const API_BASE_URL: &str = "https://api.sgroup.qq.com";
+use tracing::{debug, info};
 
 #[derive(Error, Debug)]
 pub enum DirectMessageError {
@@ -17,6 +16,16 @@ pub enum DirectMessageError {
 
     #[error("JSON解析错误: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl ApiError for DirectMessageError {
+    fn from_api(msg: String) -> Self {
+        Self::Api(msg)
+    }
+
+    fn from_json(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
@@ -98,14 +107,15 @@ pub struct Author {
 
 pub struct DirectMessageClient {
     http_client: Arc<Client>,
-    access_token: Arc<str>,
+    authorization: Arc<str>,
 }
 
 impl DirectMessageClient {
     pub fn new(http_client: Arc<Client>, access_token: Arc<str>) -> Self {
+        let authorization = Arc::from(format!("QQBot {}", access_token));
         Self {
             http_client,
-            access_token,
+            authorization,
         }
     }
 
@@ -115,47 +125,19 @@ impl DirectMessageClient {
         message: DirectMessageRequest,
     ) -> Result<DirectMessageResponse, DirectMessageError> {
         let url = format!("{}/v2/users/{}/messages", API_BASE_URL, openid);
-        let msg_json = serde_json::to_string(&message)?;
 
-        info!(openid = %openid, message = ?msg_json, "发送单聊消息");
+        info!(openid = %openid, message = ?message, "发送单聊消息");
         debug!(url = %url, "请求URL");
 
         let response = self
             .http_client
             .post(&url)
-            .header(
-                "Authorization",
-                format!("QQBot {}", self.access_token),
-            )
+            .header("Authorization", &*self.authorization)
             .json(&message)
             .send()
             .await?;
 
-        let status = response.status();
-        debug!(status = %status, "收到响应");
-
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-            error!(status = %status, error = %error_text, "发送消息失败");
-            return Err(DirectMessageError::Api(error_text));
-        }
-
-        let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-
-        let message_response: DirectMessageResponse = match serde_json::from_str(&response_text) {
-            Ok(msg) => {
-                debug!(response = %response_text, "成功解析响应JSON");
-                msg
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    response = %response_text,
-                    "JSON解析失败, 响应原生内容"
-                );
-                return Err(DirectMessageError::Json(e));
-            }
-        };
+        let message_response: DirectMessageResponse = parse_response::<_, DirectMessageError>(response).await?;
 
         info!(
             message_id = %message_response.id,
