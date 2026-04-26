@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
 
             info!(intents = intents, "启动WebSocket服务");
-            ws_client.connect(handler).await?;
+            ws_client.run(handler).await?;
         }
     }
 

@@ -12,6 +12,6 @@ pub use direct_message::{
 pub use handler::DefaultMessageHandler;
 pub use share_link::{ShareLinkClient, ShareLinkError, ShareLinkRequest, ShareLinkResponse};
 pub use websocket::{
-    MessageAuthor, MessageEvent, MessageScene, WebSocketClient, WebSocketConfig, WebSocketError,
-    WebSocketHandler,
+    DisconnectReason, MessageAuthor, MessageEvent, MessageScene, WebSocketClient, WebSocketConfig,
+    WebSocketError, WebSocketHandler,
 };

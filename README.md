@@ -115,7 +115,7 @@ let token = auth_client.get_access_token().await?;
 
 let ws_config = WebSocketConfig::new(token, intents);
 let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
-ws_client.connect(handler).await?;
+ws_client.run(handler).await?;
 ```
 
 ## 日志

@@ -4,16 +4,18 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 const GATEWAY_URL: &str = "wss://api.sgroup.qq.com/websocket/";
 const MAX_CONCURRENT_HANDLERS: usize = 10;
+const MAX_BACKOFF_SECS: u64 = 30;
+const HEARTBEAT_ACK_TIMEOUT_FACTOR: u64 = 3;
 
 #[derive(Error, Debug)]
 pub enum WebSocketError {
@@ -43,6 +45,14 @@ pub enum OpCode {
     HeartbeatAck = 11,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisconnectReason {
+    Reconnect,
+    InvalidSession,
+    HeartbeatTimeout,
+    NetworkError,
+}
+
 #[derive(Debug, Serialize)]
 struct IdentifyPayload {
     token: String,
@@ -59,6 +69,13 @@ struct Properties {
     browser: String,
     #[serde(rename = "$device")]
     device: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumePayload {
+    token: String,
+    session_id: String,
+    seq: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +102,12 @@ struct ReadyData {
     user: User,
     #[allow(dead_code)]
     shard: [i32; 2],
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ResumedData {
+    trace: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +143,11 @@ pub struct MessageEvent {
 }
 
 pub trait WebSocketHandler: Send + Sync {
-    fn on_message(&self, message: MessageEvent, client: Arc<WebSocketClient>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn on_message(
+        &self,
+        message: MessageEvent,
+        client: Arc<WebSocketClient>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +186,7 @@ impl WebSocketConfig {
 pub struct WebSocketClient {
     config: WebSocketConfig,
     http_client: Arc<Client>,
-    session_id: std::sync::OnceLock<String>,
+    session_id: RwLock<Option<String>>,
     last_sequence: Arc<AtomicI32>,
 }
 
@@ -168,7 +195,7 @@ impl WebSocketClient {
         Self {
             config,
             http_client,
-            session_id: std::sync::OnceLock::new(),
+            session_id: RwLock::new(None),
             last_sequence: Arc::new(AtomicI32::new(0)),
         }
     }
@@ -181,7 +208,56 @@ impl WebSocketClient {
         &self.http_client
     }
 
-    pub async fn connect(self: Arc<Self>, handler: Arc<dyn WebSocketHandler>) -> Result<(), WebSocketError> {
+    pub async fn get_session_id(&self) -> Option<String> {
+        self.session_id.read().await.clone()
+    }
+
+    pub fn get_last_sequence(&self) -> i32 {
+        self.last_sequence.load(Ordering::Relaxed)
+    }
+
+    async fn clear_session(&self) {
+        *self.session_id.write().await = None;
+        self.last_sequence.store(0, Ordering::Relaxed);
+    }
+
+    pub async fn run(self: Arc<Self>, handler: Arc<dyn WebSocketHandler>) -> Result<(), WebSocketError> {
+        let mut backoff_secs: u64 = 1;
+
+        loop {
+            match Arc::clone(&self).connect_inner(Arc::clone(&handler)).await {
+                Ok(reason) => {
+                    let can_resume = reason != DisconnectReason::InvalidSession;
+                    if !can_resume {
+                        self.clear_session().await;
+                    }
+
+                    info!(
+                        reason = ?reason,
+                        can_resume = can_resume,
+                        backoff_secs = backoff_secs,
+                        "连接断开，准备重连"
+                    );
+
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                }
+                Err(e) => {
+                    self.clear_session().await;
+
+                    error!(error = %e, "连接失败，准备重连");
+
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                }
+            }
+        }
+    }
+
+    async fn connect_inner(
+        self: Arc<Self>,
+        handler: Arc<dyn WebSocketHandler>,
+    ) -> Result<DisconnectReason, WebSocketError> {
         info!(url = %GATEWAY_URL, "开始连接WebSocket");
 
         let (ws_stream, _) = connect_async(GATEWAY_URL).await?;
@@ -206,71 +282,127 @@ impl WebSocketClient {
         }
 
         let hello_data: HelloData = serde_json::from_value(
-            hello.d.ok_or_else(|| WebSocketError::Receive("Hello消息缺少数据".to_string()))?,
+            hello
+                .d
+                .ok_or_else(|| WebSocketError::Receive("Hello消息缺少数据".to_string()))?,
         )?;
 
         let heartbeat_interval = hello_data.heartbeat_interval;
         info!(heartbeat_interval = heartbeat_interval, "收到心跳间隔");
 
-        let identify = WebSocketMessage {
-            op: OpCode::Identify,
-            d: Some(IdentifyPayload {
-                token: format!("QQBot {}", self.config.token),
-                intents: self.config.intents,
-                shard: self.config.shard,
-                properties: Properties {
-                    os: std::env::consts::OS.to_string(),
-                    browser: "qq-bot".to_string(),
-                    device: "qq-bot".to_string(),
-                },
-            }),
-            s: None,
-            t: None,
-        };
+        let session_id = self.session_id.read().await.clone();
+        let seq = self.last_sequence.load(Ordering::Relaxed);
 
-        let identify_json = serde_json::to_string(&identify)?;
-        debug!(message = %identify_json, "发送Identify消息");
-        write.send(WsMessage::Text(identify_json.into())).await?;
+        if let Some(sid) = session_id
+            && seq > 0
+        {
+            let resume = WebSocketMessage {
+                op: OpCode::Resume,
+                d: Some(ResumePayload {
+                    token: format!("QQBot {}", self.config.token),
+                    session_id: sid,
+                    seq,
+                }),
+                s: None,
+                t: None,
+            };
 
-        let ready_msg = read
-            .next()
-            .await
-            .ok_or_else(|| WebSocketError::Receive("未收到Ready消息".to_string()))??;
+            let resume_json = serde_json::to_string(&resume)?;
+            debug!(message = %resume_json, "发送Resume消息");
+            write.send(WsMessage::Text(resume_json.into())).await?;
+        } else {
+            let identify = WebSocketMessage {
+                op: OpCode::Identify,
+                d: Some(IdentifyPayload {
+                    token: format!("QQBot {}", self.config.token),
+                    intents: self.config.intents,
+                    shard: self.config.shard,
+                    properties: Properties {
+                        os: std::env::consts::OS.to_string(),
+                        browser: "qq-bot".to_string(),
+                        device: "qq-bot".to_string(),
+                    },
+                }),
+                s: None,
+                t: None,
+            };
 
-        let ready_text = ready_msg.to_text()?;
-        debug!(message = %ready_text, "收到Ready消息");
-
-        let ready: IncomingMessage = serde_json::from_str(ready_text)?;
-        if ready.op != OpCode::Dispatch || ready.t.as_deref() != Some("READY") {
-            return Err(WebSocketError::Receive(format!(
-                "期望READY事件, 收到 {:?}",
-                ready.t
-            )));
+            let identify_json = serde_json::to_string(&identify)?;
+            debug!(message = %identify_json, "发送Identify消息");
+            write.send(WsMessage::Text(identify_json.into())).await?;
         }
 
-        let ready_data: ReadyData = serde_json::from_value(
-            ready.d.ok_or_else(|| WebSocketError::Receive("Ready消息缺少数据".to_string()))?,
-        )?;
+        let auth_msg = read
+            .next()
+            .await
+            .ok_or_else(|| WebSocketError::Receive("未收到鉴权响应".to_string()))??;
 
-        self.session_id.set(ready_data.session_id.clone()).ok();
+        let auth_text = auth_msg.to_text()?;
 
-        info!(
-            session_id = %ready_data.session_id,
-            user_id = %ready_data.user.id,
-            username = %ready_data.user.username,
-            "登录鉴权成功"
-        );
+        let auth_incoming: IncomingMessage = serde_json::from_str(auth_text)?;
+        match auth_incoming.op {
+            OpCode::InvalidSession => {
+                warn!("Resume失败，收到InvalidSession");
+                self.clear_session().await;
+                return Ok(DisconnectReason::InvalidSession);
+            }
+            OpCode::Dispatch if auth_incoming.t.as_deref() == Some("READY") => {
+                let ready_data: ReadyData = serde_json::from_value(
+                    auth_incoming
+                        .d
+                        .ok_or_else(|| WebSocketError::Receive("Ready消息缺少数据".to_string()))?,
+                )?;
 
-        let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<()>(1);
+                *self.session_id.write().await = Some(ready_data.session_id.clone());
+
+                info!(
+                    session_id = %ready_data.session_id,
+                    user_id = %ready_data.user.id,
+                    username = %ready_data.user.username,
+                    "Identify鉴权成功"
+                );
+            }
+            OpCode::Dispatch if auth_incoming.t.as_deref() == Some("RESUMED") => {
+                info!("Resume鉴权成功，恢复会话");
+            }
+            _ => {
+                return Err(WebSocketError::Receive(format!(
+                    "期望READY/RESUMED事件, 收到 op={:?} t={:?}",
+                    auth_incoming.op, auth_incoming.t
+                )));
+            }
+        }
+
+        let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectReason>(1);
         let (event_tx, mut event_rx) = mpsc::channel::<MessageEvent>(32);
+        let last_heartbeat_ack = Arc::new(AtomicI64::new(0));
 
+        let write = Arc::new(Mutex::new(write));
+        let heartbeat_write = Arc::clone(&write);
         let last_sequence = Arc::clone(&self.last_sequence);
-        let write_handle = tokio::spawn(async move {
+        let heartbeat_ack_clone = Arc::clone(&last_heartbeat_ack);
+        let disconnect_tx_heartbeat = disconnect_tx.clone();
+
+        let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval));
+            let ack_timeout = Duration::from_millis(heartbeat_interval * HEARTBEAT_ACK_TIMEOUT_FACTOR);
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        let now = chrono_specific_now_ms();
+                        let last_ack = heartbeat_ack_clone.load(Ordering::Relaxed);
+                        if last_ack > 0 && now - last_ack > ack_timeout.as_millis() as i64 {
+                            warn!(
+                                last_ack_ms = last_ack,
+                                now_ms = now,
+                                timeout_ms = ack_timeout.as_millis() as i64,
+                                "心跳ACK超时"
+                            );
+                            let _ = disconnect_tx_heartbeat.send(DisconnectReason::HeartbeatTimeout).await;
+                            break;
+                        }
+
                         let seq = last_sequence.load(Ordering::Relaxed);
                         let heartbeat = WebSocketMessage::<i32> {
                             op: OpCode::Heartbeat,
@@ -282,8 +414,10 @@ impl WebSocketClient {
                         match serde_json::to_string(&heartbeat) {
                             Ok(json) => {
                                 debug!(seq = seq, "发送心跳");
-                                if let Err(e) = write.send(WsMessage::Text(json.into())).await {
+                                let mut writer = heartbeat_write.lock().await;
+                                if let Err(e) = writer.send(WsMessage::Text(json.into())).await {
                                     error!(error = %e, "发送心跳失败");
+                                    let _ = disconnect_tx_heartbeat.send(DisconnectReason::NetworkError).await;
                                     break;
                                 }
                             }
@@ -292,17 +426,15 @@ impl WebSocketClient {
                             }
                         }
                     }
-
-                    _ = heartbeat_rx.recv() => {
-                        info!("停止心跳任务");
-                        break;
-                    }
                 }
             }
         });
 
         let last_sequence_read = Arc::new(AtomicI32::new(0));
         let last_sequence_clone = Arc::clone(&last_sequence_read);
+        let heartbeat_ack_reader = Arc::clone(&last_heartbeat_ack);
+        let disconnect_tx_read = disconnect_tx.clone();
+
         let read_handle = tokio::spawn(async move {
             while let Some(msg_result) = read.next().await {
                 match msg_result {
@@ -317,6 +449,7 @@ impl WebSocketClient {
 
                                 match incoming.op {
                                     OpCode::HeartbeatAck => {
+                                        heartbeat_ack_reader.store(chrono_specific_now_ms(), Ordering::Relaxed);
                                         debug!("收到心跳ACK");
                                     }
                                     OpCode::Dispatch => {
@@ -337,10 +470,12 @@ impl WebSocketClient {
                                     }
                                     OpCode::Reconnect => {
                                         warn!("收到重连请求");
+                                        let _ = disconnect_tx_read.send(DisconnectReason::Reconnect).await;
                                         break;
                                     }
                                     OpCode::InvalidSession => {
                                         error!("收到无效会话消息");
+                                        let _ = disconnect_tx_read.send(DisconnectReason::InvalidSession).await;
                                         break;
                                     }
                                     _ => {
@@ -352,43 +487,61 @@ impl WebSocketClient {
                     }
                     Err(e) => {
                         error!(error = %e, "接收消息错误");
+                        let _ = disconnect_tx_read.send(DisconnectReason::NetworkError).await;
                         break;
                     }
                 }
             }
-
-            let _ = heartbeat_tx.send(()).await;
         });
+
+        drop(disconnect_tx);
 
         info!("开始接收事件");
 
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
 
-        while let Some(message_event) = event_rx.recv().await {
-            info!(
-                message_id = %message_event.id,
-                author_id = %message_event.author.id,
-                content = %message_event.content,
-                "收到文本消息"
-            );
+        let disconnect_reason = tokio::select! {
+            reason = disconnect_rx.recv() => {
+                reason.unwrap_or(DisconnectReason::NetworkError)
+            }
+            _ = async {
+                while let Some(message_event) = event_rx.recv().await {
+                    info!(
+                        message_id = %message_event.id,
+                        author_id = %message_event.author.id,
+                        content = %message_event.content,
+                        "收到文本消息"
+                    );
 
-            let handler_clone = Arc::clone(&handler);
-            let client_clone = Arc::clone(&self);
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let handler_clone = Arc::clone(&handler);
+                    let client_clone = Arc::clone(&self);
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-            tokio::spawn(async move {
-                handler_clone.on_message(message_event, client_clone).await;
-                drop(permit);
-            });
-        }
+                    tokio::spawn(async move {
+                        handler_clone.on_message(message_event, client_clone).await;
+                        drop(permit);
+                    });
+                }
+            } => {
+                DisconnectReason::NetworkError
+            }
+        };
 
-        write_handle.abort();
+        heartbeat_handle.abort();
         read_handle.abort();
 
-        Ok(())
-    }
+        let seq = last_sequence_read.load(Ordering::Relaxed);
+        if seq > 0 {
+            self.last_sequence.store(seq, Ordering::Relaxed);
+        }
 
-    pub fn get_session_id(&self) -> Option<&str> {
-        self.session_id.get().map(|s| s.as_str())
+        Ok(disconnect_reason)
     }
+}
+
+fn chrono_specific_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
