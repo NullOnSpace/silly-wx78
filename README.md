@@ -79,7 +79,7 @@ src/
 实现 `WebSocketHandler` trait 即可自定义事件处理逻辑：
 
 ```rust
-use qq_bot::{CancellationToken, DirectMessageClient, WebSocketClient, WebSocketHandler, MessageEvent};
+use qq_bot::{AuthClient, AuthConfig, CancellationToken, DirectMessageClient, WebSocketClient, WebSocketHandler, MessageEvent};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -92,7 +92,7 @@ impl WebSocketHandler for MyHandler {
             let openid = message.author.user_openid.as_deref().unwrap_or(&message.author.id);
             let dm_client = DirectMessageClient::new(
                 Arc::clone(client.http_client()),
-                Arc::clone(client.token()),
+                Arc::clone(client.auth_client()),
             );
             dm_client.reply_message(
                 openid,
@@ -110,11 +110,10 @@ impl WebSocketHandler for MyHandler {
 ```rust
 let http_client = Arc::new(reqwest::Client::new());
 let config = AuthConfig::from_env()?;
-let auth_client = AuthClient::new(config, Arc::clone(&http_client));
-let token = auth_client.get_access_token().await?;
+let auth_client = Arc::new(AuthClient::new(config, Arc::clone(&http_client)));
 
-let ws_config = WebSocketConfig::new(token, intents);
-let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
+let ws_config = WebSocketConfig::new(intents);
+let ws_client = Arc::new(WebSocketClient::new(Arc::clone(&auth_client), ws_config, Arc::clone(&http_client)));
 ws_client.run(handler, CancellationToken::new()).await?;
 ```
 

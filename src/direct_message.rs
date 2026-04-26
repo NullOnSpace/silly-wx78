@@ -1,3 +1,4 @@
+use crate::auth::AuthClient;
 use crate::{parse_response, ApiError, API_BASE_URL};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,9 @@ use tracing::{debug, info};
 pub enum DirectMessageError {
     #[error("HTTP请求错误: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("认证错误: {0}")]
+    Auth(#[from] crate::auth::AuthError),
 
     #[error("API错误: {0}")]
     Api(String),
@@ -107,15 +111,14 @@ pub struct Author {
 
 pub struct DirectMessageClient {
     http_client: Arc<Client>,
-    authorization: Arc<str>,
+    auth_client: Arc<AuthClient>,
 }
 
 impl DirectMessageClient {
-    pub fn new(http_client: Arc<Client>, access_token: Arc<str>) -> Self {
-        let authorization = Arc::from(format!("QQBot {}", access_token));
+    pub fn new(http_client: Arc<Client>, auth_client: Arc<AuthClient>) -> Self {
         Self {
             http_client,
-            authorization,
+            auth_client,
         }
     }
 
@@ -125,6 +128,8 @@ impl DirectMessageClient {
         message: DirectMessageRequest,
     ) -> Result<DirectMessageResponse, DirectMessageError> {
         let url = format!("{}/v2/users/{}/messages", API_BASE_URL, openid);
+        let token = self.auth_client.get_access_token().await?;
+        let authorization = format!("QQBot {}", token);
 
         info!(openid = %openid, message = ?message, "发送单聊消息");
         debug!(url = %url, "请求URL");
@@ -132,7 +137,7 @@ impl DirectMessageClient {
         let response = self
             .http_client
             .post(&url)
-            .header("Authorization", &*self.authorization)
+            .header("Authorization", &authorization)
             .json(&message)
             .send()
             .await?;

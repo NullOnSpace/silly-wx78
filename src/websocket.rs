@@ -1,3 +1,5 @@
+use crate::auth::AuthClient;
+use crate::auth::AuthError;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,9 @@ pub enum WebSocketError {
 
     #[error("JSON解析错误: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("认证错误: {0}")]
+    Auth(#[from] AuthError),
 
     #[error("发送错误: {0}")]
     Send(String),
@@ -165,15 +170,13 @@ struct IncomingMessage {
 
 #[derive(Debug, Clone)]
 pub struct WebSocketConfig {
-    pub token: Arc<str>,
     pub intents: i32,
     pub shard: [i32; 2],
 }
 
 impl WebSocketConfig {
-    pub fn new(token: Arc<str>, intents: i32) -> Self {
+    pub fn new(intents: i32) -> Self {
         Self {
-            token,
             intents,
             shard: [0, 1],
         }
@@ -186,6 +189,7 @@ impl WebSocketConfig {
 }
 
 pub struct WebSocketClient {
+    auth_client: Arc<AuthClient>,
     config: WebSocketConfig,
     http_client: Arc<Client>,
     session_id: RwLock<Option<String>>,
@@ -193,8 +197,9 @@ pub struct WebSocketClient {
 }
 
 impl WebSocketClient {
-    pub fn new(config: WebSocketConfig, http_client: Arc<Client>) -> Self {
+    pub fn new(auth_client: Arc<AuthClient>, config: WebSocketConfig, http_client: Arc<Client>) -> Self {
         Self {
+            auth_client,
             config,
             http_client,
             session_id: RwLock::new(None),
@@ -202,8 +207,8 @@ impl WebSocketClient {
         }
     }
 
-    pub fn token(&self) -> &Arc<str> {
-        &self.config.token
+    pub fn auth_client(&self) -> &Arc<AuthClient> {
+        &self.auth_client
     }
 
     pub fn http_client(&self) -> &Arc<Client> {
@@ -325,13 +330,16 @@ impl WebSocketClient {
         let session_id = self.session_id.read().ok().and_then(|g| g.clone());
         let seq = self.last_sequence.load(Ordering::Relaxed);
 
+        let token = self.auth_client.get_access_token().await?;
+        let authorization = format!("QQBot {}", token);
+
         if let Some(sid) = session_id
             && seq > 0
         {
             let resume = WebSocketMessage {
                 op: OpCode::Resume,
                 d: Some(ResumePayload {
-                    token: format!("QQBot {}", self.config.token),
+                    token: authorization,
                     session_id: sid,
                     seq,
                 }),
@@ -346,7 +354,7 @@ impl WebSocketClient {
             let identify = WebSocketMessage {
                 op: OpCode::Identify,
                 d: Some(IdentifyPayload {
-                    token: format!("QQBot {}", self.config.token),
+                    token: authorization,
                     intents: self.config.intents,
                     shard: self.config.shard,
                     properties: Properties {

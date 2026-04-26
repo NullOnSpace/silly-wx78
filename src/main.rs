@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AuthConfig::from_env()?;
     let http_client = Arc::new(Client::new());
-    let auth_client = AuthClient::new(config, Arc::clone(&http_client));
+    let auth_client = Arc::new(AuthClient::new(config, Arc::clone(&http_client)));
 
     match cli.command {
         Commands::Auth => {
@@ -68,10 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::SendMessage { openid, content } => {
-            let token = auth_client.get_access_token().await?;
-            info!("成功获取access_token");
-
-            let message_client = DirectMessageClient::new(Arc::clone(&http_client), Arc::clone(&token));
+            let message_client = DirectMessageClient::new(Arc::clone(&http_client), Arc::clone(&auth_client));
 
             match message_client.send_text(&openid, content).await {
                 Ok(response) => {
@@ -91,10 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::GenerateLink { callback_data } => {
-            let token = auth_client.get_access_token().await?;
-            info!("成功获取access_token");
-
-            let share_link_client = ShareLinkClient::new(Arc::clone(&http_client), Arc::clone(&token));
+            let share_link_client = ShareLinkClient::new(Arc::clone(&http_client), Arc::clone(&auth_client));
 
             let url = if let Some(data) = callback_data {
                 share_link_client.generate_share_link_with_callback(data).await?
@@ -107,12 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Websocket { intents } => {
-            let token = auth_client.get_access_token().await?;
-            info!("成功获取access_token");
-
             let handler = Arc::new(DefaultMessageHandler);
-            let ws_config = WebSocketConfig::new(token, intents);
-            let ws_client = Arc::new(WebSocketClient::new(ws_config, Arc::clone(&http_client)));
+            let ws_config = WebSocketConfig::new(intents);
+            let ws_client = Arc::new(WebSocketClient::new(Arc::clone(&auth_client), ws_config, Arc::clone(&http_client)));
 
             info!(intents = intents, "启动WebSocket服务");
             let cancellation_token = CancellationToken::new();

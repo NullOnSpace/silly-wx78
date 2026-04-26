@@ -43,7 +43,7 @@ pub(crate) async fn parse_response<T: serde::de::DeserializeOwned, E: ApiError>(
     }
 }
 
-pub use auth::{AuthClient, AuthConfig};
+pub use auth::{AuthClient, AuthConfig, AuthError};
 pub use direct_message::{
     DirectMessageClient, DirectMessageError, DirectMessageRequest, DirectMessageResponse,
     MessageType,

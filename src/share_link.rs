@@ -1,3 +1,4 @@
+use crate::auth::AuthClient;
 use crate::{parse_response, ApiError, API_BASE_URL};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,9 @@ use tracing::{debug, info};
 pub enum ShareLinkError {
     #[error("HTTP请求错误: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("认证错误: {0}")]
+    Auth(#[from] crate::auth::AuthError),
 
     #[error("API错误: {0}")]
     Api(String),
@@ -60,15 +64,14 @@ pub struct ShareLinkResponse {
 
 pub struct ShareLinkClient {
     http_client: Arc<Client>,
-    authorization: Arc<str>,
+    auth_client: Arc<AuthClient>,
 }
 
 impl ShareLinkClient {
-    pub fn new(http_client: Arc<Client>, access_token: Arc<str>) -> Self {
-        let authorization = Arc::from(format!("QQBot {}", access_token));
+    pub fn new(http_client: Arc<Client>, auth_client: Arc<AuthClient>) -> Self {
         Self {
             http_client,
-            authorization,
+            auth_client,
         }
     }
 
@@ -77,6 +80,8 @@ impl ShareLinkClient {
         request: ShareLinkRequest,
     ) -> Result<ShareLinkResponse, ShareLinkError> {
         let url = format!("{}/v2/generate_url_link", API_BASE_URL);
+        let token = self.auth_client.get_access_token().await?;
+        let authorization = format!("QQBot {}", token);
 
         info!(
             callback_data = ?request.callback_data,
@@ -87,7 +92,7 @@ impl ShareLinkClient {
         let response = self
             .http_client
             .post(&url)
-            .header("Authorization", &*self.authorization)
+            .header("Authorization", &authorization)
             .json(&request)
             .send()
             .await?;

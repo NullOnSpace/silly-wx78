@@ -17,7 +17,7 @@ impl WebSocketHandler for DefaultMessageHandler {
 
             let dm_client = DirectMessageClient::new(
                 Arc::clone(client.http_client()),
-                Arc::clone(client.token()),
+                Arc::clone(client.auth_client()),
             );
 
             match dm_client.reply_message(openid, message.id.clone(), reply_content.clone(), None).await {
