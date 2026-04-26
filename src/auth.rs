@@ -1,3 +1,4 @@
+use crate::{ApiError, parse_response};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
@@ -20,21 +21,31 @@ pub enum AuthError {
     #[error("API错误: {0}")]
     Api(String),
 
-    #[error("Token已过期")]
-    TokenExpired,
+    #[error("JSON解析错误: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl ApiError for AuthError {
+    fn from_api(msg: String) -> Self {
+        Self::Api(msg)
+    }
+
+    fn from_json(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    pub app_id: String,
-    pub client_secret: String,
+    pub app_id: Arc<str>,
+    pub client_secret: Arc<str>,
 }
 
 impl AuthConfig {
     pub fn from_env() -> Result<Self, AuthError> {
         debug!("从环境变量加载配置");
-        let app_id = env::var("QQ_BOT_APP_ID")?;
-        let client_secret = env::var("QQ_BOT_CLIENT_SECRET")?;
+        let app_id = Arc::from(env::var("QQ_BOT_APP_ID")?) as Arc<str>;
+        let client_secret = Arc::from(env::var("QQ_BOT_CLIENT_SECRET")?) as Arc<str>;
         info!(app_id = %app_id, "成功加载配置");
         Ok(Self {
             app_id,
@@ -44,9 +55,9 @@ impl AuthConfig {
 }
 
 #[derive(Debug, Serialize)]
-struct TokenRequest {
-    app_id: String,
-    client_secret: String,
+struct TokenRequest<'a> {
+    app_id: &'a str,
+    client_secret: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,10 +128,18 @@ impl AuthClient {
     }
 
     async fn refresh_token(&self) -> Result<Arc<str>, AuthError> {
+        let mut cache = self.cached_token.write().await;
+        if let Some(token) = cache.as_ref()
+            && !token.is_expired()
+        {
+            debug!("其他调用者已刷新token，使用缓存");
+            return Ok(Arc::clone(&token.access_token));
+        }
+
         info!("开始刷新access_token");
         let request = TokenRequest {
-            app_id: self.config.app_id.clone(),
-            client_secret: self.config.client_secret.clone(),
+            app_id: &self.config.app_id,
+            client_secret: &self.config.client_secret,
         };
 
         debug!(url = %AUTH_URL, "发送获取token请求");
@@ -131,31 +150,7 @@ impl AuthClient {
             .send()
             .await?;
 
-        let status = response.status();
-        debug!(status = %status, "收到响应");
-
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-            error!(status = %status, error = %error_text, "获取token失败");
-            return Err(AuthError::Api(error_text));
-        }
-
-        let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
-
-        let token_response: TokenResponse = match serde_json::from_str(&response_text) {
-            Ok(token) => {
-                debug!(response = %response_text, "成功解析响应JSON");
-                token
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    response = %response_text,
-                    "JSON解析失败, 响应原生内容"
-                );
-                return Err(AuthError::Api(format!("JSON解析失败: {}", e)));
-            }
-        };
+        let token_response: TokenResponse = parse_response::<_, AuthError>(response).await?;
 
         info!(
             expires_in = token_response.expires_in,
@@ -166,13 +161,13 @@ impl AuthClient {
         let cached_token = CachedToken::new(Arc::clone(&access_token), token_response.expires_in);
         debug!("缓存新的access_token");
 
-        let mut cache = self.cached_token.write().await;
         *cache = Some(cached_token);
 
         Ok(access_token)
     }
 
-    pub fn authorization_header(token: &str) -> String {
-        format!("QQBot {}", token)
+    pub async fn get_authorization(&self) -> Result<String, AuthError> {
+        let token = self.get_access_token().await?;
+        Ok(format!("QQBot {}", token))
     }
 }

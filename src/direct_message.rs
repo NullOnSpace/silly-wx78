@@ -1,5 +1,5 @@
 use crate::auth::AuthClient;
-use crate::{parse_response, ApiError, API_BASE_URL};
+use crate::{API_BASE_URL, ApiError, parse_response};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
@@ -93,22 +93,6 @@ pub struct ExtInfo {
     pub ref_idx: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DirectMessageEvent {
-    pub id: String,
-    pub author: Author,
-    pub content: String,
-    pub timestamp: String,
-    pub guild_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Author {
-    pub id: String,
-    pub username: String,
-    pub avatar: Option<String>,
-}
-
 pub struct DirectMessageClient {
     http_client: Arc<Client>,
     auth_client: Arc<AuthClient>,
@@ -128,8 +112,7 @@ impl DirectMessageClient {
         message: DirectMessageRequest,
     ) -> Result<DirectMessageResponse, DirectMessageError> {
         let url = format!("{}/v2/users/{}/messages", API_BASE_URL, openid);
-        let token = self.auth_client.get_access_token().await?;
-        let authorization = format!("QQBot {}", token);
+        let authorization = self.auth_client.get_authorization().await?;
 
         info!(openid = %openid, message = ?message, "发送单聊消息");
         debug!(url = %url, "请求URL");
@@ -142,7 +125,8 @@ impl DirectMessageClient {
             .send()
             .await?;
 
-        let message_response: DirectMessageResponse = parse_response::<_, DirectMessageError>(response).await?;
+        let message_response: DirectMessageResponse =
+            parse_response::<_, DirectMessageError>(response).await?;
 
         info!(
             message_id = %message_response.id,

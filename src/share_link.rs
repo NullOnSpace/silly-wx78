@@ -1,5 +1,5 @@
 use crate::auth::AuthClient;
-use crate::{parse_response, ApiError, API_BASE_URL};
+use crate::{API_BASE_URL, ApiError, parse_response};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -80,8 +80,7 @@ impl ShareLinkClient {
         request: ShareLinkRequest,
     ) -> Result<ShareLinkResponse, ShareLinkError> {
         let url = format!("{}/v2/generate_url_link", API_BASE_URL);
-        let token = self.auth_client.get_access_token().await?;
-        let authorization = format!("QQBot {}", token);
+        let authorization = self.auth_client.get_authorization().await?;
 
         info!(
             callback_data = ?request.callback_data,
@@ -97,7 +96,8 @@ impl ShareLinkClient {
             .send()
             .await?;
 
-        let share_link_response: ShareLinkResponse = parse_response::<_, ShareLinkError>(response).await?;
+        let share_link_response: ShareLinkResponse =
+            parse_response::<_, ShareLinkError>(response).await?;
 
         info!(
             url = %share_link_response.url,

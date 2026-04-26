@@ -20,12 +20,18 @@ pub(crate) async fn parse_response<T: serde::de::DeserializeOwned, E: ApiError>(
     debug!(status = %status, "收到响应");
 
     if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "未知错误".to_string());
         error!(status = %status, error = %error_text, "API请求失败");
         return Err(E::from_api(error_text));
     }
 
-    let response_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
+    let response_text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "未知错误".to_string());
 
     match serde_json::from_str(&response_text) {
         Ok(data) => {

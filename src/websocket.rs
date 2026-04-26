@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use std::sync::RwLock;
-use tokio::sync::{mpsc, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const GATEWAY_URL: &str = "wss://api.sgroup.qq.com/websocket/";
@@ -118,10 +118,11 @@ struct ResumedData {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct User {
-    pub id: String,
-    pub username: String,
-    pub bot: bool,
+struct User {
+    id: String,
+    username: String,
+    #[allow(dead_code)]
+    bot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,9 +163,7 @@ struct IncomingMessage {
     op: OpCode,
     #[serde(default)]
     d: Option<Box<serde_json::value::RawValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     t: Option<String>,
 }
 
@@ -197,7 +196,11 @@ pub struct WebSocketClient {
 }
 
 impl WebSocketClient {
-    pub fn new(auth_client: Arc<AuthClient>, config: WebSocketConfig, http_client: Arc<Client>) -> Self {
+    pub fn new(
+        auth_client: Arc<AuthClient>,
+        config: WebSocketConfig,
+        http_client: Arc<Client>,
+    ) -> Self {
         Self {
             auth_client,
             config,
@@ -238,52 +241,47 @@ impl WebSocketClient {
         let mut backoff_secs: u64 = 1;
 
         loop {
-            tokio::select! {
-                result = Arc::clone(&self).connect_inner(Arc::clone(&handler), cancellation_token.clone()) => {
-                    match result {
-                        Ok(reason) => {
-                            let can_resume = reason != DisconnectReason::InvalidSession;
-                            if !can_resume {
-                                self.clear_session();
-                            }
+            let result = Arc::clone(&self)
+                .connect_inner(Arc::clone(&handler), cancellation_token.clone())
+                .await;
+            match result {
+                Ok(reason) => {
+                    let can_resume = reason != DisconnectReason::InvalidSession;
+                    if !can_resume {
+                        self.clear_session();
+                    }
 
-                            info!(
-                                reason = ?reason,
-                                can_resume = can_resume,
-                                backoff_secs = backoff_secs,
-                                "连接断开，准备重连"
-                            );
+                    info!(
+                        reason = ?reason,
+                        can_resume = can_resume,
+                        backoff_secs = backoff_secs,
+                        "连接断开，准备重连"
+                    );
 
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
-                                    backoff_secs = 1;
-                                }
-                                _ = cancellation_token.cancelled() => {
-                                    info!("收到关机信号，停止重连");
-                                    return Ok(());
-                                }
-                            }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
+                            backoff_secs = 1;
                         }
-                        Err(e) => {
-                            self.clear_session();
-
-                            error!(error = %e, "连接失败，准备重连");
-
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
-                                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                                }
-                                _ = cancellation_token.cancelled() => {
-                                    info!("收到关机信号，停止重连");
-                                    return Ok(());
-                                }
-                            }
+                        _ = cancellation_token.cancelled() => {
+                            info!("收到关机信号，停止重连");
+                            return Ok(());
                         }
                     }
                 }
-                _ = cancellation_token.cancelled() => {
-                    info!("收到关机信号，停止重连");
-                    return Ok(());
+                Err(e) => {
+                    self.clear_session();
+
+                    error!(error = %e, "连接失败，准备重连");
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
+                            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        }
+                        _ = cancellation_token.cancelled() => {
+                            info!("收到关机信号，停止重连");
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -330,8 +328,7 @@ impl WebSocketClient {
         let session_id = self.session_id.read().ok().and_then(|g| g.clone());
         let seq = self.last_sequence.load(Ordering::Relaxed);
 
-        let token = self.auth_client.get_access_token().await?;
-        let authorization = format!("QQBot {}", token);
+        let authorization = self.auth_client.get_authorization().await?;
 
         if let Some(sid) = session_id
             && seq > 0
@@ -426,7 +423,8 @@ impl WebSocketClient {
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval));
-            let ack_timeout = Duration::from_millis(heartbeat_interval * HEARTBEAT_ACK_TIMEOUT_FACTOR);
+            let ack_timeout =
+                Duration::from_millis(heartbeat_interval * HEARTBEAT_ACK_TIMEOUT_FACTOR);
 
             loop {
                 tokio::select! {
@@ -496,9 +494,15 @@ impl WebSocketClient {
                                             if t == "C2C_MESSAGE_CREATE" {
                                                 #[allow(clippy::collapsible_if)]
                                                 if let Some(data) = incoming.d
-                                                    && let Ok(message_event) = serde_json::from_str::<MessageEvent>(data.get())
-                                                    && message_event.message_type == 0 {
-                                                    if let Err(e) = event_tx.send(message_event).await {
+                                                    && let Ok(message_event) =
+                                                        serde_json::from_str::<MessageEvent>(
+                                                            data.get(),
+                                                        )
+                                                    && message_event.message_type == 0
+                                                {
+                                                    if let Err(e) =
+                                                        event_tx.send(message_event).await
+                                                    {
                                                         error!(error = %e, "发送事件到通道失败");
                                                     }
                                                 }
@@ -509,12 +513,16 @@ impl WebSocketClient {
                                     }
                                     OpCode::Reconnect => {
                                         warn!("收到重连请求");
-                                        let _ = disconnect_tx_read.send(DisconnectReason::Reconnect).await;
+                                        let _ = disconnect_tx_read
+                                            .send(DisconnectReason::Reconnect)
+                                            .await;
                                         break;
                                     }
                                     OpCode::InvalidSession => {
                                         error!("收到无效会话消息");
-                                        let _ = disconnect_tx_read.send(DisconnectReason::InvalidSession).await;
+                                        let _ = disconnect_tx_read
+                                            .send(DisconnectReason::InvalidSession)
+                                            .await;
                                         break;
                                     }
                                     _ => {
@@ -526,7 +534,9 @@ impl WebSocketClient {
                     }
                     Err(e) => {
                         error!(error = %e, "接收消息错误");
-                        let _ = disconnect_tx_read.send(DisconnectReason::NetworkError).await;
+                        let _ = disconnect_tx_read
+                            .send(DisconnectReason::NetworkError)
+                            .await;
                         break;
                     }
                 }
