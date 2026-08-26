@@ -39,6 +39,78 @@ code	message	说明
 304082	upload media info fail	富媒体资源拉取失败，请重试
 304083	convert media info fail	富媒体资源拉取失败，请重试
 
+## 发送 Markdown 消息（msg_type=2）
+
+> 依据官方文档《Markdown 消息》（2026/04/23 能力更新）：单聊、群聊场景的自定义
+> Markdown 已开放**所有机器人**使用，无需申请模板；频道场景需内邀。
+
+### 请求体协议
+
+`markdown` 是请求体中独立的 object 字段（与 content 平级），字段如下：
+
+| 属性 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| content | string | 否 | 自定义 markdown 文本内容 |
+| custom_template_id | string | 否 | markdown 模版id，申请模版后获得 |
+| params | Array | 否 | `{key: xxx, values: xxx}`，模版内变量与填充值的kv映射 |
+
+`content` 与 `custom_template_id` **二选一**（库内构造与发送时均会校验）。
+原生 markdown 形如：
+
+```json
+{
+  "msg_type": 2,
+  "msg_id": "<被动回复时携带>",
+  "msg_seq": 1,
+  "markdown": { "content": "# 标题 \n## 简介\n[🔗腾讯](https://www.qq.com)" }
+}
+```
+
+### 库 API
+
+```rust
+// 原生自定义 markdown（主动发送，受审核/配额限制）
+dm_client.send_markdown(&openid, "# 标题\n**加粗**").await?;
+
+// 被动回复（推荐）：msg_id 来自收到的 C2C_MESSAGE_CREATE 事件，
+// 有效期约 5 分钟，同一 msg_id 最多回复 5 次，msg_seq 从 1 开始递增
+dm_client.reply_markdown(&openid, &event.id, "# 收到", 1).await?;
+
+// 模板 markdown（模板 id 在开放平台管理端申请）
+dm_client.send_markdown_template(&openid, "101993071_1658748972", vec![
+    MarkdownParam::single("title", "标题"),
+    MarkdownParam::new("link", vec!["https://www.qq.com".into()]),
+]).await?;
+
+// 或在任意 DirectMessageRequest 上链式附加（自动置 msg_type=Markdown 并清空互斥的 content）
+let req = DirectMessageRequest::reply(msg_id, String::new(), None)
+    .with_markdown(MarkdownPayload::native("# md"));
+```
+
+CLI：
+
+```bash
+# 原生 markdown（不传 -m 时发送演示文案）
+cargo run -- send-markdown -o <openid> -m "# 标题\n**加粗**"
+# 被动回复
+cargo run -- send-markdown -o <openid> -m "# 回复" --reply-to <msg_id>
+# 模板 + 变量
+cargo run -- send-markdown -o <openid> --template <模板id> --param title=标题 --param link=https://qq.com
+```
+
+### 支持语法（节选）
+
+`#`~`###` 标题；`**加粗**`、`__下划线加粗__`、`*斜体*`、`***粗斜体***`、`~~删除线~~`；
+`[文字](url)` 链接与 `<https://doc.qq.com>` 裸链接；
+`![说明 #宽px #高px](url)` 图片（公网可访问 url，平台会下载转存）；
+有序/无序列表及嵌套（二级列表前空 4 格）；`>` 块引用；`***` 分割线。
+
+### 实测记录
+
+- 用无效 openid 探测：服务端返回 `11255 用户不存在`（资源层错误）而非参数错误，
+  说明 `msg_type=2 + markdown` 请求体格式被平台正常接受；
+- 单聊场景**只能发不能收** markdown（用户发来的 markdown 不产生事件内容）。
+
 ## 接收事件
 
 ### 单聊消息

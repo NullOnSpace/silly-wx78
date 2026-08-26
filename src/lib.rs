@@ -174,7 +174,7 @@ pub(crate) mod de {
 pub use auth::{AuthClient, AuthConfig, AuthError};
 pub use direct_message::{
     DirectMessageClient, DirectMessageError, DirectMessageRequest, DirectMessageResponse,
-    MessageType,
+    MarkdownParam, MarkdownPayload, MessageType,
 };
 pub use guild::{
     ApiPermissionEntry, ApiPermissionList, ChannelInfo, ChannelKind, ChannelMessage,

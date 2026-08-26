@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use qq_bot::guild::{GuildClient, PatchChannelRequest};
 use qq_bot::{
     AuthClient, AuthConfig, CancellationToken, ChannelMessageRequest, ChannelMessageSendOutcome,
-    DefaultMessageHandler, DirectMessageClient, ShareLinkClient, WebSocketClient, WebSocketConfig,
-    intents,
+    DefaultMessageHandler, DirectMessageClient, MarkdownParam, ShareLinkClient, WebSocketClient,
+    WebSocketConfig, intents,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -29,6 +29,22 @@ enum Commands {
         openid: String,
         #[arg(short, long, help = "消息内容")]
         content: String,
+    },
+
+    /// 发送单聊 markdown 消息（msg_type=2，原生文本或模板二选一）
+    SendMarkdown {
+        #[arg(short, long, help = "用户的openid")]
+        openid: String,
+        #[arg(short, long, help = "原生 markdown 文本（与 --template 二选一）")]
+        markdown: Option<String>,
+        #[arg(long, help = "markdown 模板 id（在开放平台管理端申请）")]
+        template: Option<String>,
+        #[arg(long = "param", help = "模板变量，格式 key=value，可重复传入")]
+        params: Vec<String>,
+        #[arg(long, help = "被回复的消息ID（被动回复模式，5分钟内有效）")]
+        reply_to: Option<String>,
+        #[arg(long, default_value_t = 1, help = "msg_seq，同一msg_id第n次回复(<=5)")]
+        msg_seq: i32,
     },
 
     /// 生成机器人分享链接
@@ -143,6 +159,23 @@ fn print_send_outcome(outcome: &ChannelMessageSendOutcome) {
     }
 }
 
+/// 官方文档《Markdown 消息》支持语法的演示文案
+const DEMO_MARKDOWN: &str = r#"# QQ Bot Markdown
+## 支持的语法演示
+
+**加粗** __下划线加粗__ *斜体* ***粗斜体*** ~~删除线~~
+
+> 引用：青青子衿，悠悠我心
+
+- 无序列表项一
+- 无序列表项二
+
+1. 有序列表项一
+2. 有序列表项二
+
+---
+[🔗腾讯网](https://www.qq.com)"#;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
@@ -184,6 +217,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!(error = %e, "发送消息失败");
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Commands::SendMarkdown {
+            openid,
+            markdown,
+            template,
+            params,
+            reply_to,
+            msg_seq,
+        } => {
+            let message_client =
+                DirectMessageClient::new(Arc::clone(&http_client), Arc::clone(&auth_client));
+
+            // 组装 markdown 载荷：原生文本与模板互斥
+            let mut request = match (markdown, template) {
+                (Some(md), None) => qq_bot::DirectMessageRequest::markdown(md),
+                (None, Some(tpl)) => {
+                    let kv: Result<Vec<MarkdownParam>, String> = params
+                        .iter()
+                        .map(|p| {
+                            p.split_once('=')
+                                .map(|(k, v)| MarkdownParam::single(k.trim(), v.trim()))
+                                .ok_or_else(|| format!("--param 格式应为 key=value, 实际: {p}"))
+                        })
+                        .collect();
+                    let kv = kv.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    if kv.is_empty() {
+                        return Err("--template 需要至少一个 --param key=value".into());
+                    }
+                    qq_bot::DirectMessageRequest::markdown_template(tpl, kv)
+                }
+                (Some(_), Some(_)) => {
+                    return Err("-m/--markdown 与 --template 只能二选一".into());
+                }
+                (None, None) => {
+                    // 未指定内容时发送一段演示 markdown，展示官方支持的语法
+                    qq_bot::DirectMessageRequest::markdown(DEMO_MARKDOWN)
+                }
+            };
+
+            if let Some(msg_id) = &reply_to {
+                request.msg_id = Some(msg_id.clone());
+                request.msg_seq = Some(msg_seq);
+            }
+
+            match message_client.send_message(&openid, request).await {
+                Ok(response) => {
+                    println!("消息ID: {}", response.id);
+                    println!("时间戳: {}", response.timestamp);
+                }
+                Err(e) => {
+                    error!(error = %e, "发送markdown消息失败");
                     return Err(e.into());
                 }
             }

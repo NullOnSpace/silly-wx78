@@ -5,7 +5,7 @@
 ## 功能
 
 - **授权认证** — 通过 AppID 和 ClientSecret 获取 access_token，支持自动缓存和刷新
-- **单聊消息** — 发送文本消息和回复消息
+- **单聊消息** — 发送文本消息、回复消息、Markdown 消息（msg_type=2，原生/模板二选一）
 - **频道(guild)接口** — 频道/子频道/成员/身份组查询、子频道改名、发消息与被动回复、撤回、精华消息、表情表态、日程管理、权限查询（详见 [docs/GUILD_API.md](docs/GUILD_API.md)）
 - **分享链接** — 生成机器人邀请分享链接
 - **WebSocket 服务** — 连接 QQ WebSocket 网关，维持心跳，自动重连与会话恢复；按事件类型分发：
@@ -69,6 +69,10 @@ cargo run -- send-channel-message -c <channel_id> -t "你好" --reply-to <msg_id
 # 主动消息（无 msg_id）：HTTP 200 但可能进入安全审核，返回 audit_id
 cargo run -- send-channel-message -c <channel_id> -t "公告"
 
+# 单聊 markdown 消息（被动回复带 --reply-to；不传 -m 发演示文案）
+cargo run -- send-markdown -o <openid> -m "# 标题\n**加粗**" --reply-to <msg_id>
+cargo run -- send-markdown -o <openid> --template <模板id> --param title=标题
+
 # 撤回（2 分钟窗口内）/ 精华消息
 cargo run -- recall -c <channel_id> -m <message_id>
 cargo run -- pins -c <channel_id> list|add|remove
@@ -94,6 +98,7 @@ cargo run -- websocket -i 100668929
 ### 平台频控与时限提醒
 
 - 被动回复 msg_id 有效期约 **5 分钟**，同一 msg_id 最多回复 **5 次**，用 `msg_seq` 区分多次回复；
+  markdown 同样适用（详见 [docs/DIRECT_MESSAGE.md](docs/DIRECT_MESSAGE.md)）；
 - 主动消息需安全审核通道并消耗月度配额，不建议作为主流程依赖；
 - 撤回窗口 **2 分钟**（自己的消息）；精华每子频道上限 **20 条**。
 
