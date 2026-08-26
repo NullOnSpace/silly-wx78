@@ -1,5 +1,6 @@
 use crate::auth::AuthClient;
 use crate::auth::AuthError;
+use crate::guild::{ChannelInfo, Guild};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,41 @@ const GATEWAY_URL: &str = "wss://api.sgroup.qq.com/websocket/";
 const MAX_CONCURRENT_HANDLERS: usize = 10;
 const MAX_BACKOFF_SECS: u64 = 30;
 const HEARTBEAT_ACK_TIMEOUT_FACTOR: u64 = 3;
+
+/// 事件订阅 intents 位定义（官方 WebSocket 文档值）。
+///
+/// 实测（docs/API_VERIFICATION.md §2.2）：`GUILDS | GUILD_MESSAGES |
+/// GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGE | GROUP_AND_C2C_EVENT | INTERACTION`
+/// 的组合（100668929）可正常收事件；全量订阅 `2113934851` 亦可用。
+pub mod intents {
+    /// 频道事件：GUILD_CREATE / GUILD_UPDATE / GUILD_DELETE 等
+    pub const GUILDS: i32 = 1 << 0;
+    /// 频道成员事件：GUILD_MEMBER_ADD / UPDATE / REMOVE
+    pub const GUILD_MEMBERS: i32 = 1 << 1;
+    /// 私域频道消息事件：MESSAGE_CREATE 等
+    pub const GUILD_MESSAGES: i32 = 1 << 9;
+    /// 频道消息表情表态事件
+    pub const GUILD_MESSAGE_REACTIONS: i32 = 1 << 10;
+    /// 私信事件：DIRECT_MESSAGE_CREATE 等
+    pub const DIRECT_MESSAGE: i32 = 1 << 12;
+    /// 群和单聊事件：GROUP_AT_MESSAGE_CREATE / C2C_MESSAGE_CREATE
+    pub const GROUP_AND_C2C_EVENT: i32 = 1 << 25;
+    /// 互动事件
+    pub const INTERACTION: i32 = 1 << 26;
+    /// 消息审核事件（主动消息安全审核结果，实测 code=304023 场景需要）
+    pub const MESSAGE_AUDIT: i32 = 1 << 27;
+
+    /// 实测可用的常用组合（不含论坛等特殊场景）
+    pub const COMMON: i32 = GUILDS
+        | GUILD_MESSAGES
+        | GUILD_MESSAGE_REACTIONS
+        | DIRECT_MESSAGE
+        | GROUP_AND_C2C_EVENT
+        | INTERACTION;
+
+    /// 全量 intents（项目历史默认值）
+    pub const ALL: i32 = 2113934851;
+}
 
 #[derive(Error, Debug)]
 pub enum WebSocketError {
@@ -150,12 +186,283 @@ pub struct MessageEvent {
     pub message_scene: Option<MessageScene>,
 }
 
+// ---------------------------------------------------------------------------
+// 频道/群/私信事件类型
+//
+// 实测结论（docs/API_VERIFICATION.md §2.3、§4.1）：
+// - 私域机器人的频道消息事件是 MESSAGE_CREATE（全量消息），公域是 AT_MESSAGE_CREATE，
+//   两者 payload 结构基本一致；
+// - 频道事件的 author 没有 user_openid 字段，身份信息走 member.roles/nick；
+// - 群@消息 GROUP_AT_MESSAGE_CREATE 以前被分发层丢弃，现单独建模。
+// ---------------------------------------------------------------------------
+
+/// 频道消息事件的作者（无 user_openid 字段）
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuildMessageAuthor {
+    pub id: String,
+    pub username: Option<String>,
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub bot: bool,
+    pub union_openid: Option<String>,
+}
+
+/// 频道消息中的成员信息
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MessageMember {
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    pub joined_at: Option<String>,
+}
+
+/// 频道消息事件（MESSAGE_CREATE 私域全量 / AT_MESSAGE_CREATE 公域@）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelMessageEvent {
+    /// 消息 ID。被动回复有效期 5 分钟、同一 id 最多回复 5 次。
+    pub id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub seq: Option<i64>,
+    pub seq_in_channel: Option<String>,
+    pub author: GuildMessageAuthor,
+    pub member: Option<MessageMember>,
+}
+
+impl ChannelMessageEvent {
+    /// 成员昵称：优先 member.nick，其次 author.username
+    pub fn display_name(&self) -> &str {
+        if let Some(member) = &self.member
+            && let Some(nick) = member.nick.as_deref().filter(|s| !s.is_empty())
+        {
+            return nick;
+        }
+        self.author.username.as_deref().unwrap_or(&self.author.id)
+    }
+}
+
+/// 仅携带 openid 的作者（群@ / 私信场景）
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenIdAuthor {
+    pub id: String,
+    pub username: Option<String>,
+    pub user_openid: Option<String>,
+    pub union_openid: Option<String>,
+}
+
+/// 群@机器人消息事件（GROUP_AT_MESSAGE_CREATE）
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupMessageEvent {
+    pub id: String,
+    pub group_openid: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub author: OpenIdAuthor,
+}
+
+/// 频道私聊消息事件（DIRECT_MESSAGE_CREATE）。payload 与频道消息类似，
+/// 但 author 带 user_openid；guild_id/channel_id 在部分场景可能缺省。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DirectMessageEvent {
+    pub id: String,
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub author: OpenIdAuthor,
+    pub member: Option<MessageMember>,
+}
+
+/// 频道(.guild)推送事件类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuildEventType {
+    Create,
+    Update,
+    Delete,
+}
+
+/// 频道(.guild)变更事件。GUILD_UPDATE 触发频率不低（改名、成员进出等都会触发），
+/// 若做缓存需注意去抖。
+#[derive(Debug, Clone)]
+pub struct GuildEvent {
+    pub event_type: GuildEventType,
+    pub guild: Guild,
+}
+
+/// 子频道推送事件类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelEventType {
+    Create,
+    Update,
+    Delete,
+}
+
+/// 子频道变更事件（CHANNEL_UPDATE 比 REST 多 op_user_id 操作者字段）
+#[derive(Debug, Clone)]
+pub struct ChannelEvent {
+    pub event_type: ChannelEventType,
+    pub channel: ChannelInfo,
+}
+
+/// handler 回调的返回 future 类型
+pub type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// WebSocket 事件处理器 trait。
+///
+/// 各回调均有默认空实现，按需覆写即可；未识别的事件类型统一进入
+/// [`WebSocketHandler::on_unknown_event`]，保证任何 payload 都不会被静默丢弃。
+///
+/// # 兼容性说明
+/// [`WebSocketHandler::on_message`] 对应单聊 C2C 文本消息（历史行为保留不变）；
+/// 频道消息请覆写 [`WebSocketHandler::on_channel_message`]。
 pub trait WebSocketHandler: Send + Sync {
+    /// 单聊(C2C)文本消息（message_type == 0）
     fn on_message(
         &self,
-        message: MessageEvent,
-        client: Arc<WebSocketClient>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+        _message: MessageEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 频道消息：私域 MESSAGE_CREATE（无需@）/ 公域 AT_MESSAGE_CREATE（需要@）
+    fn on_channel_message(
+        &self,
+        _event: ChannelMessageEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 群@机器人消息
+    fn on_group_message(
+        &self,
+        _event: GroupMessageEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 频道私信消息
+    fn on_direct_message(
+        &self,
+        _event: DirectMessageEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 频道(guild)创建/更新/删除
+    fn on_guild_event(
+        &self,
+        _event: GuildEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 子频道创建/更新/删除
+    fn on_channel_event(
+        &self,
+        _event: ChannelEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 未识别事件类型的兜底回调（含解析失败的消息事件原始 payload）
+    fn on_unknown_event(
+        &self,
+        _event_type: String,
+        _payload: String,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+}
+
+/// 内部分发事件：由 read loop 按 `t` 字段解析后投入通道
+pub(crate) enum DispatchEvent {
+    C2cMessage(MessageEvent),
+    ChannelMessage(ChannelMessageEvent),
+    GroupMessage(GroupMessageEvent),
+    DirectMessage(DirectMessageEvent),
+    Guild(GuildEvent),
+    Channel(ChannelEvent),
+    Unknown { event_type: String, payload: String },
+}
+
+/// 按事件类型把 dispatch payload 解析为内部事件；任何失败都回落到 Unknown，
+/// 不再像旧版那样静默丢弃非 C2C 事件。
+fn decode_dispatch(event_type: &str, data: Option<&serde_json::value::RawValue>) -> DispatchEvent {
+    let parsed = match event_type {
+        "C2C_MESSAGE_CREATE" => data
+            .and_then(|d| serde_json::from_str::<MessageEvent>(d.get()).ok())
+            // 历史行为：仅分发纯文本(type=0)，媒体等其他类型进入 Unknown 兜底
+            .filter(|m| m.message_type == 0)
+            .map(DispatchEvent::C2cMessage),
+        "MESSAGE_CREATE" | "AT_MESSAGE_CREATE" => data
+            .and_then(|d| serde_json::from_str::<ChannelMessageEvent>(d.get()).ok())
+            .map(DispatchEvent::ChannelMessage),
+        "GROUP_AT_MESSAGE_CREATE" => data
+            .and_then(|d| serde_json::from_str::<GroupMessageEvent>(d.get()).ok())
+            .map(DispatchEvent::GroupMessage),
+        "DIRECT_MESSAGE_CREATE" => data
+            .and_then(|d| serde_json::from_str::<DirectMessageEvent>(d.get()).ok())
+            .map(DispatchEvent::DirectMessage),
+        "GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE" => data
+            .and_then(|d| serde_json::from_str::<Guild>(d.get()).ok())
+            .map(|guild| {
+                DispatchEvent::Guild(GuildEvent {
+                    event_type: match event_type {
+                        "GUILD_CREATE" => GuildEventType::Create,
+                        "GUILD_UPDATE" => GuildEventType::Update,
+                        _ => GuildEventType::Delete,
+                    },
+                    guild,
+                })
+            }),
+        "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => data
+            .and_then(|d| serde_json::from_str::<ChannelInfo>(d.get()).ok())
+            .map(|channel| {
+                DispatchEvent::Channel(ChannelEvent {
+                    event_type: match event_type {
+                        "CHANNEL_CREATE" => ChannelEventType::Create,
+                        "CHANNEL_UPDATE" => ChannelEventType::Update,
+                        _ => ChannelEventType::Delete,
+                    },
+                    channel,
+                })
+            }),
+        _ => None,
+    };
+
+    parsed.unwrap_or_else(|| {
+        if matches!(
+            event_type,
+            "C2C_MESSAGE_CREATE"
+                | "MESSAGE_CREATE"
+                | "AT_MESSAGE_CREATE"
+                | "GROUP_AT_MESSAGE_CREATE"
+                | "DIRECT_MESSAGE_CREATE"
+                | "GUILD_CREATE"
+                | "GUILD_UPDATE"
+                | "GUILD_DELETE"
+                | "CHANNEL_CREATE"
+                | "CHANNEL_UPDATE"
+                | "CHANNEL_DELETE"
+        ) {
+            warn!(event_type = %event_type, "事件解析失败，转入未知事件兜底");
+        } else {
+            debug!(event_type = %event_type, "收到未注册的事件类型");
+        }
+        DispatchEvent::Unknown {
+            event_type: event_type.to_string(),
+            payload: data.map(|d| d.get().to_string()).unwrap_or_default(),
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,7 +721,7 @@ impl WebSocketClient {
         }
 
         let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectReason>(1);
-        let (event_tx, mut event_rx) = mpsc::channel::<MessageEvent>(32);
+        let (event_tx, mut event_rx) = mpsc::channel::<DispatchEvent>(64);
         let last_heartbeat_ack = Arc::new(AtomicI64::new(0));
 
         let last_sequence = Arc::clone(&self.last_sequence);
@@ -491,23 +798,9 @@ impl WebSocketClient {
                                     }
                                     OpCode::Dispatch => {
                                         if let Some(t) = incoming.t.as_deref() {
-                                            if t == "C2C_MESSAGE_CREATE" {
-                                                #[allow(clippy::collapsible_if)]
-                                                if let Some(data) = incoming.d
-                                                    && let Ok(message_event) =
-                                                        serde_json::from_str::<MessageEvent>(
-                                                            data.get(),
-                                                        )
-                                                    && message_event.message_type == 0
-                                                {
-                                                    if let Err(e) =
-                                                        event_tx.send(message_event).await
-                                                    {
-                                                        error!(error = %e, "发送事件到通道失败");
-                                                    }
-                                                }
-                                            } else {
-                                                debug!(event_type = %t, "收到非文本消息事件，忽略");
+                                            let event = decode_dispatch(t, incoming.d.as_deref());
+                                            if let Err(e) = event_tx.send(event).await {
+                                                error!(error = %e, "发送事件到通道失败");
                                             }
                                         }
                                     }
@@ -554,20 +847,68 @@ impl WebSocketClient {
                 reason.unwrap_or(DisconnectReason::NetworkError)
             }
             _ = async {
-                while let Some(message_event) = event_rx.recv().await {
-                    info!(
-                        message_id = %message_event.id,
-                        author_id = %message_event.author.id,
-                        content = %message_event.content,
-                        "收到文本消息"
-                    );
-
+                while let Some(event) = event_rx.recv().await {
                     let handler_clone = Arc::clone(&handler);
                     let client_clone = Arc::clone(&self);
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
 
                     tokio::spawn(async move {
-                        handler_clone.on_message(message_event, client_clone).await;
+                        match event {
+                            DispatchEvent::C2cMessage(message_event) => {
+                                info!(
+                                    message_id = %message_event.id,
+                                    author_id = %message_event.author.id,
+                                    content = %message_event.content,
+                                    "收到单聊文本消息"
+                                );
+                                handler_clone.on_message(message_event, client_clone).await;
+                            }
+                            DispatchEvent::ChannelMessage(event) => {
+                                info!(
+                                    message_id = %event.id,
+                                    channel_id = %event.channel_id,
+                                    author = %event.display_name(),
+                                    content = %event.content,
+                                    "收到频道消息"
+                                );
+                                handler_clone.on_channel_message(event, client_clone).await;
+                            }
+                            DispatchEvent::GroupMessage(event) => {
+                                info!(
+                                    message_id = %event.id,
+                                    group_openid = %event.group_openid,
+                                    content = %event.content,
+                                    "收到群@消息"
+                                );
+                                handler_clone.on_group_message(event, client_clone).await;
+                            }
+                            DispatchEvent::DirectMessage(event) => {
+                                info!(
+                                    message_id = %event.id,
+                                    author_id = %event.author.id,
+                                    content = %event.content,
+                                    "收到频道私信消息"
+                                );
+                                handler_clone.on_direct_message(event, client_clone).await;
+                            }
+                            DispatchEvent::Guild(event) => {
+                                debug!(?event.event_type, guild_id = ?event.guild.id, "收到频道变更事件");
+                                handler_clone.on_guild_event(event, client_clone).await;
+                            }
+                            DispatchEvent::Channel(event) => {
+                                debug!(?event.event_type, channel_id = %event.channel.id, "收到子频道变更事件");
+                                handler_clone.on_channel_event(event, client_clone).await;
+                            }
+                            DispatchEvent::Unknown {
+                                event_type,
+                                payload,
+                            } => {
+                                debug!(%event_type, "转发未知事件到兜底回调");
+                                handler_clone
+                                    .on_unknown_event(event_type, payload, client_clone)
+                                    .await;
+                            }
+                        }
                         drop(permit);
                     });
                 }
@@ -592,4 +933,158 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::value::RawValue;
+
+    fn raw(json: &str) -> Option<Box<RawValue>> {
+        serde_json::from_str::<Box<RawValue>>(json).ok()
+    }
+
+    /// docs/API_VERIFICATION.md §4.1 的 MESSAGE_CREATE 完整样例
+    const MESSAGE_CREATE_SAMPLE: &str = r#"{
+        "author": {
+            "avatar": "https://qqchannel-profile-1251316161.file.myqcloud.com/...",
+            "bot": false,
+            "id": "5688363186875882260",
+            "union_openid": "",
+            "username": "besiege"
+        },
+        "channel_id": "9478690",
+        "content": "wawa",
+        "guild_id": "17327925269880161597",
+        "id": "08bd8ae3ad9c87cabcf00110a2c4c204380348b79abbd406",
+        "member": {
+            "joined_at": "2022-08-01T09:06:33+08:00",
+            "nick": "besiege",
+            "roles": ["4", "5", "14"]
+        },
+        "seq": 3,
+        "seq_in_channel": "3",
+        "timestamp": "2026-08-26T19:25:43+08:00"
+    }"#;
+
+    /// docs/API_VERIFICATION.md §4.2 的 CHANNEL_UPDATE 样例
+    const CHANNEL_UPDATE_SAMPLE: &str = r#"{
+        "application_id": "0",
+        "guild_id": "17327925269880161597",
+        "id": "9478690",
+        "name": "活动互助",
+        "op_user_id": "5688363186875882260",
+        "owner_id": "5688363186875882260",
+        "parent_id": "644066500",
+        "permissions": "3",
+        "position": 2,
+        "private_type": 0,
+        "speak_permission": 1,
+        "sub_type": 0,
+        "type": 0
+    }"#;
+
+    #[test]
+    fn parses_private_domain_message_create() {
+        let event: ChannelMessageEvent = serde_json::from_str(MESSAGE_CREATE_SAMPLE).unwrap();
+        assert_eq!(event.id, "08bd8ae3ad9c87cabcf00110a2c4c204380348b79abbd406");
+        assert_eq!(event.guild_id, "17327925269880161597");
+        assert_eq!(event.channel_id, "9478690");
+        assert_eq!(event.content, "wawa");
+        assert_eq!(event.seq, Some(3));
+        // author 无 user_openid，身份走 member
+        let member = event.member.as_ref().unwrap();
+        assert_eq!(member.roles, vec!["4", "5", "14"]);
+        assert_eq!(event.display_name(), "besiege");
+    }
+
+    #[test]
+    fn parses_group_at_message() {
+        let body = r#"{
+            "author": {"id": "GABC", "union_openid": "", "user_openid": "OUABC"},
+            "content": "在吗",
+            "group_openid": "GOPENID",
+            "id": "msgid-1",
+            "timestamp": "2026-08-26T19:30:00+08:00"
+        }"#;
+        let event: GroupMessageEvent = serde_json::from_str(body).unwrap();
+        assert_eq!(event.group_openid, "GOPENID");
+        assert_eq!(event.author.user_openid.as_deref(), Some("OUABC"));
+    }
+
+    #[test]
+    fn decode_dispatch_routes_all_registered_types() {
+        let msg = raw(MESSAGE_CREATE_SAMPLE).unwrap();
+        match decode_dispatch("MESSAGE_CREATE", Some(&msg)) {
+            DispatchEvent::ChannelMessage(event) => {
+                assert_eq!(event.channel_id, "9478690");
+            }
+            _ => panic!("MESSAGE_CREATE 应分发到 ChannelMessage"),
+        }
+
+        let channel = raw(CHANNEL_UPDATE_SAMPLE).unwrap();
+        match decode_dispatch("CHANNEL_UPDATE", Some(&channel)) {
+            DispatchEvent::Channel(event) => {
+                assert_eq!(event.event_type, ChannelEventType::Update);
+                assert_eq!(
+                    event.channel.op_user_id.as_deref(),
+                    Some("5688363186875882260")
+                );
+                assert!(event.channel.is_text());
+            }
+            _ => panic!("CHANNEL_UPDATE 应分发到 Channel 事件"),
+        }
+
+        let guild = raw(r#"{"id":"17327925269880161597","name":"饥荒助手内测"}"#).unwrap();
+        match decode_dispatch("GUILD_UPDATE", Some(&guild)) {
+            DispatchEvent::Guild(event) => {
+                assert_eq!(event.event_type, GuildEventType::Update);
+                assert_eq!(event.guild.id, "17327925269880161597");
+            }
+            _ => panic!("GUILD_UPDATE 应分发到 Guild 事件"),
+        }
+    }
+
+    #[test]
+    fn decode_dispatch_falls_back_to_unknown_instead_of_dropping() {
+        // 旧版会静默丢弃的事件：现在进入 Unknown 兜底回调
+        let body = raw(r#"{"foo":"bar"}"#).unwrap();
+        match decode_dispatch("SOME_NEW_EVENT", Some(&body)) {
+            DispatchEvent::Unknown {
+                event_type,
+                payload,
+            } => {
+                assert_eq!(event_type, "SOME_NEW_EVENT");
+                assert_eq!(payload, r#"{"foo":"bar"}"#);
+            }
+            _ => panic!("未注册事件应进入 Unknown"),
+        }
+
+        // 已注册但解析失败（如 C2C 媒体消息 message_type!=0）同样兜底而非丢弃
+        let media = raw(
+            r#"{"id":"m1","author":{"id":"u1","bot":false},"content":"","message_type":7,"timestamp":"t"}"#,
+        )
+        .unwrap();
+        match decode_dispatch("C2C_MESSAGE_CREATE", Some(&media)) {
+            DispatchEvent::Unknown { event_type, .. } => {
+                assert_eq!(event_type, "C2C_MESSAGE_CREATE");
+            }
+            _ => panic!("非文本 C2C 消息应进入 Unknown 兜底"),
+        }
+    }
+
+    #[test]
+    fn intents_common_combo_matches_verified_value() {
+        // docs/API_VERIFICATION.md §2.2 实测可用的组合
+        assert_eq!(
+            intents::GUILDS
+                | intents::GUILD_MESSAGES
+                | intents::GUILD_MESSAGE_REACTIONS
+                | intents::DIRECT_MESSAGE
+                | intents::GROUP_AND_C2C_EVENT
+                | intents::INTERACTION,
+            100668929
+        );
+        assert_eq!(intents::ALL, 2113934851);
+    }
 }
