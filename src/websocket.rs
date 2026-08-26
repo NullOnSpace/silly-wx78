@@ -163,8 +163,11 @@ struct User {
 
 #[derive(Debug, Deserialize)]
 pub struct MessageAuthor {
+    /// 平台消息 ID；单聊(C2C)事件中可能缺省，仅携带 user_openid
+    #[serde(default)]
     pub id: String,
     pub username: Option<String>,
+    #[serde(default)]
     pub bot: bool,
     pub user_openid: Option<String>,
     pub union_openid: Option<String>,
@@ -181,6 +184,8 @@ pub struct MessageEvent {
     pub id: String,
     pub author: MessageAuthor,
     pub content: String,
+    /// 消息内容类型（0=文本）；部分事件载荷可能缺省
+    #[serde(default)]
     pub message_type: i32,
     pub timestamp: String,
     pub message_scene: Option<MessageScene>,
@@ -1071,6 +1076,26 @@ mod tests {
             }
             _ => panic!("非文本 C2C 消息应进入 Unknown 兜底"),
         }
+    }
+
+    #[test]
+    fn parses_minimal_c2c_event_from_official_docs() {
+        // docs/DIRECT_MESSAGE.md 单聊事件示例：author 仅含 user_openid，
+        // 无 id/bot/message_type 字段，严格反序列化会失败导致事件被丢入兜底
+        let body = r#"{
+            "author": {"user_openid": "E4F4AEA33253A2797FB897C50B81D7ED"},
+            "content": "123",
+            "id": "ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!",
+            "timestamp": "2023-11-06T13:37:18+08:00"
+        }"#;
+        let event: MessageEvent = serde_json::from_str(body).unwrap();
+        assert_eq!(event.author.id, "");
+        assert_eq!(
+            event.author.user_openid.as_deref(),
+            Some("E4F4AEA33253A2797FB897C50B81D7ED")
+        );
+        assert_eq!(event.message_type, 0);
+        assert_eq!(event.content, "123");
     }
 
     #[test]
