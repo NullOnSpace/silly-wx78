@@ -227,3 +227,21 @@ GUILD_UPDATE payload 与 `GET /guilds/{id}` 结构一致（description/icon/id/j
 | roles 接口 `hoist` 为整数 | `GET /guilds/{gid}/roles` 返回 `"hoist":1/0` 而非布尔，严格反序列化失败 | `de::opt_lenient_bool` 兼容布尔/0/1 |
 | `/users/@me` 偶发 50015009 | 平台侧「系统繁忙」HTTP 500，重试成功 | 无需处理，调用方重试 |
 | 文字子频道 online_nums 报文 | `{"code":505007,"message":"requested channel is not audio or live channel"}` | 与 §五 预期一致 |
+
+---
+
+## 八、单聊 markdown（msg_type=2）实测（2026-09-09，push-architecture 批次三前置）
+
+> 验证方式：qq-bot CLI `send-markdown` 真实发送（AppID 19035***589，C2C 私聊 openid 为 my-wx78 现网接收人）。
+> 目的：确定 render-hub QQ 渲染器（`PayloadKind::QqMarkdown`）的能力档次（DESIGN 未决事项 #1）。
+
+| 试验 | 结果 | 结论 |
+|------|------|------|
+| 原生 markdown（标题+粗体） | ✅ 发送成功（HTTP OK，返回 message_id） | **原生 markdown 可用于私聊主动消息** |
+| 原生 markdown（标题+列表+链接+引用） | ✅ 发送成功 | 列表/链接/引用语法均可通过 API 层 |
+| 模板 markdown（`--template`） | ❌ 400 `40034124 markdown消息参数错误` | 该机器人**未申请 markdown 模板**；模板路线不可用（除非管理端申请，暂不需要） |
+| 文本直发（msg_type=0 对照） | ✅ 发送成功 | 主动文本同样可用（未触发安全审核） |
+
+**render-hub 定档结论**：QQ 渲染器以 **原生 markdown（`payload_kind=QqMarkdown`）为主 payload、`Text` 为 fallback**；模板路线（`--template`）在当前机器人资质下不可用。30_000 字节上限仍是占位值（QQ 侧未见公开硬限，保持 render-hub 现有注释与降级保护）。
+
+**配额提醒**：以上均为主动消息（无 msg_id）。多次主动私聊未触发审核拦截，但平台月度配额消耗属实——推送类消息建议维持低频（现有 DST/新闻节奏可接受）。
