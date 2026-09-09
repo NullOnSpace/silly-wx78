@@ -13,7 +13,7 @@ dotenvy = "0.15"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 tokio-util = { version = "0.7", features = ["rt"] }
