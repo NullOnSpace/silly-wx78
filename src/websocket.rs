@@ -1,6 +1,6 @@
 use crate::auth::AuthClient;
 use crate::auth::AuthError;
-use crate::guild::{ChannelInfo, Guild};
+use crate::guild::{ChannelInfo, Guild, Member, MessageAudited};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -311,6 +311,77 @@ pub struct ChannelEvent {
     pub channel: ChannelInfo,
 }
 
+/// 频道成员事件类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuildMemberEventType {
+    Add,
+    Update,
+    Remove,
+}
+
+/// 频道成员事件（GUILD_MEMBER_ADD/UPDATE/REMOVE）。
+///
+/// payload 在 [`Member`] 基础上增加 `guild_id` 与 `op_user_id`（操作人）；
+/// 注意 `joined_at`/`roles` 字段未做标准化处理，使用前建议判空。
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuildMemberEvent {
+    pub guild_id: String,
+    pub op_user_id: Option<String>,
+    #[serde(flatten)]
+    pub member: Member,
+}
+
+/// 表情表态事件类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageReactionEventType {
+    Add,
+    Remove,
+}
+
+/// 表态所用表情。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageReactionEmoji {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub emoji_type: i32,
+}
+
+/// 表态对象（0=消息、1=帖子、2=评论、3=回复）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageReactionTarget {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub target_type: i32,
+}
+
+/// 表情表态事件（MESSAGE_REACTION_ADD/REMOVE，需订阅 GUILD_MESSAGE_REACTIONS）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageReactionEvent {
+    pub user_id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+    pub target: MessageReactionTarget,
+    pub emoji: MessageReactionEmoji,
+}
+
+/// 音视频/直播子频道成员进出事件类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOrLiveChannelMemberEventType {
+    Enter,
+    Exit,
+}
+
+/// 音视频/直播子频道成员进出事件
+/// （AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER/EXIT）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioOrLiveChannelMemberEvent {
+    pub guild_id: String,
+    pub channel_id: String,
+    /// 2=音视频子频道，5=直播子频道（官方注释值）
+    pub channel_type: i32,
+    pub user_id: String,
+}
+
 /// handler 回调的返回 future 类型
 pub type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
@@ -377,6 +448,54 @@ pub trait WebSocketHandler: Send + Sync {
         Box::pin(async {})
     }
 
+    /// 频道成员加入/更新/离开
+    fn on_guild_member_event(
+        &self,
+        _event_type: GuildMemberEventType,
+        _event: GuildMemberEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 主动消息审核通过（需订阅 MESSAGE_AUDIT(1<<27)）
+    fn on_message_audit_pass(
+        &self,
+        _event: MessageAudited,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 主动消息审核不通过（需订阅 MESSAGE_AUDIT(1<<27)）
+    fn on_message_audit_reject(
+        &self,
+        _event: MessageAudited,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 消息表情表态新增/移除（需订阅 GUILD_MESSAGE_REACTIONS）
+    fn on_message_reaction(
+        &self,
+        _event_type: MessageReactionEventType,
+        _event: MessageReactionEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
+    /// 音视频/直播子频道成员进入/离开
+    fn on_audio_or_live_channel_member(
+        &self,
+        _event_type: AudioOrLiveChannelMemberEventType,
+        _event: AudioOrLiveChannelMemberEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> HandlerFuture<'_> {
+        Box::pin(async {})
+    }
+
     /// 未识别事件类型的兜底回调（含解析失败的消息事件原始 payload）
     fn on_unknown_event(
         &self,
@@ -396,7 +515,24 @@ pub(crate) enum DispatchEvent {
     DirectMessage(DirectMessageEvent),
     Guild(GuildEvent),
     Channel(ChannelEvent),
-    Unknown { event_type: String, payload: String },
+    GuildMember {
+        event_type: GuildMemberEventType,
+        event: Box<GuildMemberEvent>,
+    },
+    MessageAuditPass(Box<MessageAudited>),
+    MessageAuditReject(Box<MessageAudited>),
+    MessageReaction {
+        event_type: MessageReactionEventType,
+        event: Box<MessageReactionEvent>,
+    },
+    AudioOrLiveChannelMember {
+        event_type: AudioOrLiveChannelMemberEventType,
+        event: Box<AudioOrLiveChannelMemberEvent>,
+    },
+    Unknown {
+        event_type: String,
+        payload: String,
+    },
 }
 
 /// 按事件类型把 dispatch payload 解析为内部事件；任何失败都回落到 Unknown，
@@ -441,6 +577,42 @@ fn decode_dispatch(event_type: &str, data: Option<&serde_json::value::RawValue>)
                     channel,
                 })
             }),
+        "GUILD_MEMBER_ADD" | "GUILD_MEMBER_UPDATE" | "GUILD_MEMBER_REMOVE" => data
+            .and_then(|d| serde_json::from_str::<GuildMemberEvent>(d.get()).ok())
+            .map(|event| DispatchEvent::GuildMember {
+                event_type: match event_type {
+                    "GUILD_MEMBER_ADD" => GuildMemberEventType::Add,
+                    "GUILD_MEMBER_UPDATE" => GuildMemberEventType::Update,
+                    _ => GuildMemberEventType::Remove,
+                },
+                event: Box::new(event),
+            }),
+        "MESSAGE_AUDIT_PASS" => data
+            .and_then(|d| serde_json::from_str::<MessageAudited>(d.get()).ok())
+            .map(|audited| DispatchEvent::MessageAuditPass(Box::new(audited))),
+        "MESSAGE_AUDIT_REJECT" => data
+            .and_then(|d| serde_json::from_str::<MessageAudited>(d.get()).ok())
+            .map(|audited| DispatchEvent::MessageAuditReject(Box::new(audited))),
+        "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => data
+            .and_then(|d| serde_json::from_str::<MessageReactionEvent>(d.get()).ok())
+            .map(|event| DispatchEvent::MessageReaction {
+                event_type: if event_type == "MESSAGE_REACTION_ADD" {
+                    MessageReactionEventType::Add
+                } else {
+                    MessageReactionEventType::Remove
+                },
+                event: Box::new(event),
+            }),
+        "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER" | "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT" => data
+            .and_then(|d| serde_json::from_str::<AudioOrLiveChannelMemberEvent>(d.get()).ok())
+            .map(|event| DispatchEvent::AudioOrLiveChannelMember {
+                event_type: if event_type == "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER" {
+                    AudioOrLiveChannelMemberEventType::Enter
+                } else {
+                    AudioOrLiveChannelMemberEventType::Exit
+                },
+                event: Box::new(event),
+            }),
         _ => None,
     };
 
@@ -458,6 +630,15 @@ fn decode_dispatch(event_type: &str, data: Option<&serde_json::value::RawValue>)
                 | "CHANNEL_CREATE"
                 | "CHANNEL_UPDATE"
                 | "CHANNEL_DELETE"
+                | "GUILD_MEMBER_ADD"
+                | "GUILD_MEMBER_UPDATE"
+                | "GUILD_MEMBER_REMOVE"
+                | "MESSAGE_AUDIT_PASS"
+                | "MESSAGE_AUDIT_REJECT"
+                | "MESSAGE_REACTION_ADD"
+                | "MESSAGE_REACTION_REMOVE"
+                | "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER"
+                | "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT"
         ) {
             warn!(event_type = %event_type, "事件解析失败，转入未知事件兜底");
         } else {
@@ -904,6 +1085,60 @@ impl WebSocketClient {
                                 debug!(?event.event_type, channel_id = %event.channel.id, "收到子频道变更事件");
                                 handler_clone.on_channel_event(event, client_clone).await;
                             }
+                            DispatchEvent::GuildMember { event_type, event } => {
+                                debug!(
+                                    ?event_type,
+                                    guild_id = %event.guild_id,
+                                    user_id = ?event.member.user.as_ref().map(|u| u.id.as_str()),
+                                    "收到频道成员变更事件"
+                                );
+                                handler_clone
+                                    .on_guild_member_event(event_type, *event, client_clone)
+                                    .await;
+                            }
+                            DispatchEvent::MessageAuditPass(event) => {
+                                info!(
+                                    audit_id = ?event.audit_id,
+                                    message_id = ?event.message_id,
+                                    "收到消息审核通过事件"
+                                );
+                                handler_clone
+                                    .on_message_audit_pass(*event, client_clone)
+                                    .await;
+                            }
+                            DispatchEvent::MessageAuditReject(event) => {
+                                info!(audit_id = ?event.audit_id, "收到消息审核不通过事件");
+                                handler_clone
+                                    .on_message_audit_reject(*event, client_clone)
+                                    .await;
+                            }
+                            DispatchEvent::MessageReaction { event_type, event } => {
+                                debug!(
+                                    ?event_type,
+                                    channel_id = %event.channel_id,
+                                    user_id = %event.user_id,
+                                    emoji_id = %event.emoji.id,
+                                    "收到表情表态事件"
+                                );
+                                handler_clone
+                                    .on_message_reaction(event_type, *event, client_clone)
+                                    .await;
+                            }
+                            DispatchEvent::AudioOrLiveChannelMember { event_type, event } => {
+                                debug!(
+                                    ?event_type,
+                                    channel_id = %event.channel_id,
+                                    user_id = %event.user_id,
+                                    "收到音视频/直播子频道成员进出事件"
+                                );
+                                handler_clone
+                                    .on_audio_or_live_channel_member(
+                                        event_type,
+                                        *event,
+                                        client_clone,
+                                    )
+                                    .await;
+                            }
                             DispatchEvent::Unknown {
                                 event_type,
                                 payload,
@@ -1111,5 +1346,136 @@ mod tests {
             100668929
         );
         assert_eq!(intents::ALL, 2113934851);
+    }
+
+    #[test]
+    fn decode_guild_member_events() {
+        // 官方《频道成员事件》示例
+        let body = raw(r#"{
+                "guild_id": "200000000",
+                "joined_at": "2021-10-21T11:20:18+08:00",
+                "nick": "",
+                "op_user_id": "100000000",
+                "roles": ["1"],
+                "user": {
+                    "avatar": "http://thirdqq.qlogo.cn/0",
+                    "bot": true,
+                    "id": "8834102668809967837",
+                    "username": "b站机器人"
+                }
+            }"#)
+        .unwrap();
+        match decode_dispatch("GUILD_MEMBER_ADD", Some(&body)) {
+            DispatchEvent::GuildMember { event_type, event } => {
+                assert_eq!(event_type, GuildMemberEventType::Add);
+                assert_eq!(event.guild_id, "200000000");
+                assert_eq!(event.op_user_id.as_deref(), Some("100000000"));
+                assert_eq!(
+                    event.member.user.as_ref().unwrap().id,
+                    "8834102668809967837"
+                );
+            }
+            _ => panic!("GUILD_MEMBER_ADD 应分发到 GuildMember 事件"),
+        }
+
+        match decode_dispatch("GUILD_MEMBER_REMOVE", Some(&body)) {
+            DispatchEvent::GuildMember { event_type, .. } => {
+                assert_eq!(event_type, GuildMemberEventType::Remove);
+            }
+            _ => panic!("GUILD_MEMBER_REMOVE 应分发到 GuildMember 事件"),
+        }
+    }
+
+    #[test]
+    fn decode_message_audit_events() {
+        // 官方《消息审核事件》示例
+        let body = raw(
+            r#"{
+                "audit_id": "5f60b782-d134-4628-93b8-9baa4b182f48",
+                "audit_time": "2022-01-04T18:05:42+08:00",
+                "channel_id": "1699792",
+                "create_time": "2022-01-04T18:05:42+08:00",
+                "guild_id": "46646271634786417",
+                "message_id": "10d0df671a1231343431313532313831383136323933383420801e280030a0cbc4013848404148f6b7d08e0650b1acf8fa05"
+            }"#,
+        )
+        .unwrap();
+        match decode_dispatch("MESSAGE_AUDIT_PASS", Some(&body)) {
+            DispatchEvent::MessageAuditPass(event) => {
+                assert_eq!(
+                    event.audit_id.as_deref(),
+                    Some("5f60b782-d134-4628-93b8-9baa4b182f48")
+                );
+                assert!(event.message_id().is_some());
+            }
+            _ => panic!("MESSAGE_AUDIT_PASS 应分发到 MessageAuditPass"),
+        }
+
+        // 审核不通过的事件没有 message_id
+        let rejected = raw(
+            r#"{"audit_id":"5f60b782-d134-4628-93b8-9baa4b182f48","channel_id":"1699792","guild_id":"46646271634786417"}"#,
+        )
+        .unwrap();
+        match decode_dispatch("MESSAGE_AUDIT_REJECT", Some(&rejected)) {
+            DispatchEvent::MessageAuditReject(event) => {
+                assert!(event.message_id().is_none());
+            }
+            _ => panic!("MESSAGE_AUDIT_REJECT 应分发到 MessageAuditReject"),
+        }
+    }
+
+    #[test]
+    fn decode_message_reaction_events() {
+        // 官方《表情表态》示例
+        let body = raw(r#"{
+                "user_id": "1111222233333",
+                "emoji": {"id": "277", "type": 1},
+                "channel_id": "12345",
+                "guild_id": "11110011112222",
+                "target": {"id": "2", "type": 0}
+            }"#)
+        .unwrap();
+        match decode_dispatch("MESSAGE_REACTION_ADD", Some(&body)) {
+            DispatchEvent::MessageReaction { event_type, event } => {
+                assert_eq!(event_type, MessageReactionEventType::Add);
+                assert_eq!(event.emoji.id, "277");
+                assert_eq!(event.emoji.emoji_type, 1);
+                assert_eq!(event.target.target_type, 0);
+            }
+            _ => panic!("MESSAGE_REACTION_ADD 应分发到 MessageReaction"),
+        }
+
+        match decode_dispatch("MESSAGE_REACTION_REMOVE", Some(&body)) {
+            DispatchEvent::MessageReaction { event_type, .. } => {
+                assert_eq!(event_type, MessageReactionEventType::Remove);
+            }
+            _ => panic!("MESSAGE_REACTION_REMOVE 应分发到 MessageReaction"),
+        }
+    }
+
+    #[test]
+    fn decode_audio_or_live_channel_member_events() {
+        let body = raw(r#"{
+                "guild_id": "47129941624960822",
+                "channel_id": "1661124",
+                "channel_type": 2,
+                "user_id": "144115218182563108"
+            }"#)
+        .unwrap();
+        match decode_dispatch("AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER", Some(&body)) {
+            DispatchEvent::AudioOrLiveChannelMember { event_type, event } => {
+                assert_eq!(event_type, AudioOrLiveChannelMemberEventType::Enter);
+                assert_eq!(event.channel_type, 2);
+                assert_eq!(event.user_id, "144115218182563108");
+            }
+            _ => panic!("AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER 应分发到成员进出事件"),
+        }
+
+        match decode_dispatch("AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT", Some(&body)) {
+            DispatchEvent::AudioOrLiveChannelMember { event_type, .. } => {
+                assert_eq!(event_type, AudioOrLiveChannelMemberEventType::Exit);
+            }
+            _ => panic!("AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT 应分发到成员进出事件"),
+        }
     }
 }

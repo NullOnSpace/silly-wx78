@@ -177,18 +177,29 @@ pub use direct_message::{
     MarkdownParam, MarkdownPayload, MessageType,
 };
 pub use guild::{
-    ApiPermissionEntry, ApiPermissionList, ChannelInfo, ChannelKind, ChannelMessage,
-    ChannelMessageRequest, ChannelMessageSendOutcome, ChannelPermissions, CreateRoleRequest, Guild,
-    GuildClient, GuildError, GuildRoles, Member, MessageAuditInfo, MessageSetting,
-    ModifyRoleRequest, PinMessages, ReactionType, ReactionUser, ReactionUsersPage, RemindType,
-    Role, RoleCreated, RoleMembersPage, Schedule, ScheduleRequest, UserInfo,
+    ANNOUNCE_TYPE_MEMBER, ANNOUNCE_TYPE_WELCOME, Announces, ApiPermissionDemand,
+    ApiPermissionDemandIdentify, ApiPermissionEntry, ApiPermissionList, AudioControl, AudioStatus,
+    ChannelInfo, ChannelKind, ChannelMessage, ChannelMessageFile, ChannelMessageRequest,
+    ChannelMessageSendOutcome, ChannelPermissionModify, ChannelPermissions, CreateAnnounceRequest,
+    CreateApiPermissionDemandRequest, CreateChannelRequest, CreateDmsRequest, CreateRoleRequest,
+    CreateThreadRequest, CreateThreadResponse, DeleteMemberRequest, DmsSession, Guild, GuildClient,
+    GuildError, GuildRoles, Member, MessageArk, MessageArkKv, MessageArkObj, MessageArkObjKv,
+    MessageAttachment, MessageAuditInfo, MessageAudited, MessageEmbed, MessageEmbedField,
+    MessageEmbedThumbnail, MessageMarkdown, MessageMarkdownParam, MessageReference, MessageSetting,
+    ModifyRoleRequest, MuteMembersRequest, MuteMembersResponse, MuteRequest, PatchScheduleRequest,
+    PinMessages, ReactionType, ReactionUser, ReactionUsersPage, RecommendChannel, RemindType, Role,
+    RoleCreated, RoleMembersPage, Schedule, ScheduleRequest, THREAD_FORMAT_HTML,
+    THREAD_FORMAT_JSON, THREAD_FORMAT_MARKDOWN, THREAD_FORMAT_TEXT, Thread, ThreadInfo,
+    ThreadsPage, UserInfo,
 };
 pub use handler::DefaultMessageHandler;
 pub use share_link::{ShareLinkClient, ShareLinkError, ShareLinkRequest, ShareLinkResponse};
 pub use tokio_util::sync::CancellationToken;
 pub use websocket::{
-    ChannelEvent, ChannelEventType, ChannelMessageEvent, DirectMessageEvent, DisconnectReason,
-    GroupMessageEvent, GuildEvent, GuildEventType, HandlerFuture, MessageAuthor, MessageEvent,
-    MessageMember, MessageScene, OpenIdAuthor, WebSocketClient, WebSocketConfig, WebSocketError,
-    WebSocketHandler, intents,
+    AudioOrLiveChannelMemberEvent, AudioOrLiveChannelMemberEventType, ChannelEvent,
+    ChannelEventType, ChannelMessageEvent, DirectMessageEvent, DisconnectReason, GroupMessageEvent,
+    GuildEvent, GuildEventType, GuildMemberEvent, GuildMemberEventType, HandlerFuture,
+    MessageAuthor, MessageEvent, MessageMember, MessageReactionEmoji, MessageReactionEvent,
+    MessageReactionEventType, MessageReactionTarget, MessageScene, OpenIdAuthor, WebSocketClient,
+    WebSocketConfig, WebSocketError, WebSocketHandler, intents,
 };
